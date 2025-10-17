@@ -13,6 +13,7 @@ import pickle
 import json
 import random
 import itertools
+import re
 from pprint import pprint
 from tqdm import tqdm
 from typing import TypedDict, List, Tuple, Optional
@@ -24,6 +25,7 @@ from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation
 from segment_anything import sam_model_registry, SamPredictor
 import torch
+import sleap_io
 
 np.set_printoptions(precision=3, suppress=True, linewidth=120)
 
@@ -98,6 +100,11 @@ annotations = None
 human_annotated = None  # (num_frames, num_camera, num_points) boolean array indicating if a point is annotated
 calibration_frames = []  # Frames selected for calibration, empty if not set
 
+# SLEAP annotations and annotation visibility flags
+sleap_annotations = None
+show_manual_annotations = True
+show_sleap_annotations = False
+
 # Shape: (num_frames, num_points, 3) for (X, Y, Z) coordinates
 reconstructed_3d_points = None
 needs_3d_reconstruction = False
@@ -162,7 +169,7 @@ point_colors = np.array([
     [64, 128, 255]    # P28 - Light Blue
 ], dtype=np.uint8)
 
-assert NUM_POINTS <= len(point_colors), "Not enough colors defined for the number of points."
+assert NUM_POINTS <= len(point_colors), "Not enough colours defined for the number of points."
 
 NUM_DIST_COEFFS = 14  # Number of distortion coefficients
 class CameraParams(TypedDict):
@@ -286,7 +293,8 @@ def reproject_points(points_3d: np.ndarray, cam_params: CameraParams) -> np.ndar
 
 def load_videos():
     """Loads all videos from the specified data folder."""
-    global annotations, reconstructed_3d_points, human_annotated, seed_points_2d, seed_mesh_poses, ground_plane_data
+    global annotations, reconstructed_3d_points, human_annotated, sleap_annotations
+    global seed_points_2d, seed_mesh_poses, ground_plane_data
     video_paths = sorted(DATA_FOLDER.glob(VIDEO_FORMAT))
     if not video_paths:
         print(f"Error: No videos found in '{DATA_FOLDER}/' with format '{VIDEO_FORMAT}'")
@@ -322,7 +330,7 @@ def load_videos():
         'points_2d': [[] for _ in range(video_metadata['num_videos'])],
         'plane_model': None
     }
-
+    sleap_annotations = np.full((video_metadata['num_frames'], video_metadata['num_videos'], NUM_POINTS, 2), np.nan, dtype=np.float32)
     print(f"Loaded {video_metadata['num_videos']} videos.")
     print(f"Resolution: {video_metadata['width']}x{video_metadata['height']}, Frames: {video_metadata['num_frames']}")
 
@@ -756,25 +764,38 @@ def draw_ui(frame, cam_idx):
     if not auto_segment_mode and not ground_plane_mode:
         if best_individual is not None:
             reprojected = reproject_points(reconstructed_3d_points[frame_idx], best_individual[cam_idx])  # (num_points, 2)
-        # Draw annotated points for the current frame
-        p_idxs = np.arange(NUM_POINTS) if not focus_selected_point else [selected_point_idx]
-        for p_idx in p_idxs:
-            point = annotations[frame_idx, cam_idx, p_idx]
-            if not np.isnan(point).any():
-                if human_annotated[frame_idx, cam_idx, p_idx]:
-                    cv2.circle(frame, tuple(point.astype(int)), 5 + 2, (255, 255, 255), -1) # White outline
-                cv2.circle(frame, tuple(point.astype(int)), 5, point_colors[p_idx].tolist(), -1)
-                cv2.putText(frame, POINT_NAMES[p_idx], tuple(point.astype(int) + np.array([5, -5])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 2)
-                # Reproject the 3D point back to 2D
-                if best_individual is None:
-                    continue
-                point_2d_from_3d = reprojected[p_idx] # (2,)
-                if not np.isnan(point_2d_from_3d).any() and (point_2d_from_3d > 0).all():
-                    # Draw a line from the reprojected point to the annotated point
-                    cv2.line(frame, tuple(point.astype(int)), tuple(point_2d_from_3d.astype(int)), point_colors[p_idx].tolist(), 1)
-                    distance = np.linalg.norm(point - point_2d_from_3d)
-                    cv2.putText(frame, f"{distance:.2f}", tuple(point_2d_from_3d.astype(int) + np.array([5, -5])),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 1)
+
+        # Draw sleap predictions if visible
+        if show_sleap_annotations:
+            p_idxs = np.arange(NUM_POINTS) if not focus_selected_point else [selected_point_idx]
+            for p_idx in p_idxs:
+                point = sleap_annotations[frame_idx, cam_idx, p_idx]
+                if not np.isnan(point).any():
+                    # Draw a square for SLEAP annotations
+                    top_left = tuple((point - 6).astype(int))
+                    bottom_right = tuple((point + 6).astype(int))
+                    cv2.rectangle(frame, top_left, bottom_right, point_colors[p_idx].tolist(), -1)
+                    cv2.putText(frame, POINT_NAMES[p_idx], tuple(point.astype(int) + np.array([8, -8])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 2)
+
+        # Draw manual annotations if visible
+        if show_manual_annotations:
+            p_idxs = np.arange(NUM_POINTS) if not focus_selected_point else [selected_point_idx]
+            for p_idx in p_idxs:
+                point = annotations[frame_idx, cam_idx, p_idx]
+                if not np.isnan(point).any():
+                    if human_annotated[frame_idx, cam_idx, p_idx]:
+                        cv2.circle(frame, tuple(point.astype(int)), 5 + 2, (255, 255, 255), -1) # White outline
+                    cv2.circle(frame, tuple(point.astype(int)), 5, point_colors[p_idx].tolist(), -1)
+                    cv2.putText(frame, POINT_NAMES[p_idx], tuple(point.astype(int) + np.array([5, -5])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 2)
+                    if best_individual is None:
+                        continue
+                    point_2d_from_3d = reprojected[p_idx] # (2,)
+                    if not np.isnan(point_2d_from_3d).any() and (point_2d_from_3d > 0).all():
+                        # Draw a line from the reprojected point to the annotated point
+                        cv2.line(frame, tuple(point.astype(int)), tuple(point_2d_from_3d.astype(int)), point_colors[p_idx].tolist(), 1)
+                        distance = np.linalg.norm(point - point_2d_from_3d)
+                        cv2.putText(frame, f"{distance:.2f}", tuple(point_2d_from_3d.astype(int) + np.array([5, -5])),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 1)
 
     # Draw 3D reconstructed mesh reprojected back down to 2D cameras
     if reconstructed_seed_mesh is not None and best_individual is not None and frame_idx >= initial_seed_axis_info.get('frame_idx', -1):
@@ -909,6 +930,77 @@ def load_state():
     except FileNotFoundError as e:
         print(f"Error loading state: {e}")
 
+def import_sleap_predictions():
+    """Handles the import of SLEAP predictions from a .slp file."""
+    dpg.show_item("file_dialog_id")
+
+def sleap_file_callback(sender, app_data):
+    """Callback for the SLEAP file dialog."""
+    file_path = pathlib.Path(app_data['file_path_name'])
+    session_match = re.search(r'(session\d+)', file_path.name)
+    if not session_match:
+        dpg.set_value("status_message", "Error: No 'sessionN' string found in the filename.")
+        dpg.show_item("status_message")
+        return
+    session_str = session_match.group(1)
+    session_files = [f for f in file_path.parent.glob(f"*{session_str}*.slp")]
+    if not session_files:
+        dpg.set_value("status_message", f"Error: No other slp files found for {session_str}.")
+        dpg.show_item("status_message")
+        return
+        
+    all_labels = [sleap_io.load_slp(str(f)) for f in session_files]
+    all_keypoints = all_labels[0].skeleton.node_names
+    with dpg.window(label="Import keypoints", modal=True, show=True, tag="sleap_keypoint_selector", width=400, height=350) as sleap_window:
+        dpg.add_text("Select the keypoints to import:")
+        def select_all(sender, app_data, user_data):
+            for keypoint in all_keypoints:
+                dpg.set_value(f"kp_checkbox_{keypoint}", True)
+        def deselect_all(sender, app_data, user_data):
+            for keypoint in all_keypoints:
+                dpg.set_value(f"kp_checkbox_{keypoint}", False)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Select all", callback=select_all)
+            dpg.add_button(label="Deselect all", callback=deselect_all)
+        for keypoint in all_keypoints:
+            dpg.add_checkbox(label=keypoint, tag=f"kp_checkbox_{keypoint}", default_value=True)
+
+        def on_import_sleap_confirm(sender, app_data):
+            selected_keypoints = [kp for kp in all_keypoints if dpg.get_value(f"kp_checkbox_{kp}")]
+            process_sleap_data(all_labels, selected_keypoints)
+            dpg.delete_item("sleap_keypoint_selector")
+        dpg.add_button(label="Import", callback=on_import_sleap_confirm)
+        viewport_width = dpg.get_viewport_width()
+        viewport_height = dpg.get_viewport_height()
+        window_width = dpg.get_item_width(sleap_window)
+        window_height = dpg.get_item_height(sleap_window)
+        dpg.set_item_pos(sleap_window, [int((viewport_width - window_width) * 0.5), int((viewport_height - window_height) * 0.5)])
+
+def process_sleap_data(all_labels: List[sleap_io.Labels], selected_keypoints: List[str]):
+    """Processes the loaded SLEAP data and populates the sleap_annotations array."""
+    global sleap_annotations
+    sleap_annotations.fill(np.nan)
+    for labels in all_labels:
+            for frame_idx, labeled_frame in enumerate(labels):
+                if frame_idx >= video_metadata['num_frames']:
+                    break
+                video_name = pathlib.Path(labeled_frame.video.filename).name
+                try:
+                    cam_idx = video_names.index(video_name)
+                except ValueError:
+                    continue # Video not found in the current project
+                for instance in labeled_frame:
+                    for node_name in selected_keypoints:
+                        if node_name in [node.name for node in labels.skeleton.nodes]:
+                            try:
+                                point = instance[node_name]
+                                x, y = point[0][0], point[0][1]
+                                if not np.isnan(x) and not np.isnan(y):
+                                    point_idx = POINT_NAMES.index(node_name)
+                                    sleap_annotations[frame_idx, cam_idx, point_idx] = (x, y)
+                            except (KeyError, ValueError):
+                                continue
+
 # --- DearPyGui UI ---
 
 def get_screen_dimensions():
@@ -977,12 +1069,17 @@ def on_key_press(sender, app_data):
 
 def create_ga_popup():
     """Creates the popup window for the genetic algorithm."""
-    with dpg.window(label="Calibration", modal=False, show=False, tag="ga_popup", width=540, height=120, on_close=toggle_ga_pause):
+    with dpg.window(label="Calibration", modal=False, show=False, tag="ga_popup", width=540, height=120, on_close=toggle_ga_pause) as ga_window:
         dpg.add_text("Running genetic algorithm...", tag="ga_status_text")
         dpg.add_text("", tag="ga_progress_text")
         with dpg.group(horizontal=True):
             dpg.add_button(label="Reset", callback=reset_ga)
             dpg.add_button(label="Pause", callback=toggle_ga_pause, tag="ga_pause_button")
+        viewport_width = dpg.get_viewport_width()
+        viewport_height = dpg.get_viewport_height()
+        window_width = dpg.get_item_width(ga_window)
+        window_height = dpg.get_item_height(ga_window)
+        dpg.set_item_pos(ga_window, [int((viewport_width - window_width) * 0.5), int((viewport_height - window_height) * 0.5)])
 
 def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
     """Creates the DearPyGui UI."""
@@ -995,11 +1092,17 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
     x_pos = int((screen_width - viewport_width) * 0.5)
     y_pos = int((screen_height - viewport_height) * 0.5)
 
+    # File dialog for SLEAP import
+    with dpg.file_dialog(directory_selector=False, show=False, callback=sleap_file_callback, tag="file_dialog_id", width=700, height=400):
+        dpg.add_file_extension(".slp", color=(0, 255, 0, 255))
+        dpg.add_file_extension(".*")
+
     dpg.create_viewport(title="CATAR", width=viewport_width, height=viewport_height, x_pos=x_pos, y_pos=y_pos)
     with dpg.viewport_menu_bar():
         with dpg.menu(label="File"):
             dpg.add_menu_item(label="Save state", callback=save_state)
             dpg.add_menu_item(label="Load state", callback=load_state)
+            dpg.add_menu_item(label="Import SLEAP predictions", callback=import_sleap_predictions)
         with dpg.menu(label="Calibration"):
             dpg.add_menu_item(label="Run genetic algorithm", callback=toggle_ga)
             dpg.add_menu_item(label="Find worst calibration", callback=find_worst_frame)
@@ -1058,12 +1161,13 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
                     create_video_grid(scene_viz)
                 # Annotation histogram
                 with dpg.child_window(height=150, tag="histogram_window"):
-                    with dpg.plot(label="Annotation Histogram", height=-1, width=-1, no_menus=True, no_box_select=True, no_mouse_pos=True, tag="annotation_plot"):
+                    with dpg.plot(label="Annotation histogram", height=-1, width=-1, no_menus=True, no_box_select=True, no_mouse_pos=True, tag="annotation_plot"):
                         dpg.add_plot_legend()
                         dpg.add_plot_axis(dpg.mvXAxis, label="Frame", tag="histogram_x_axis")
                         dpg.add_plot_axis(dpg.mvYAxis, label="Annotations", tag="histogram_y_axis")
-                        dpg.add_bar_series(list(range(video_metadata['num_frames'])), [0]*video_metadata['num_frames'], label="Annotation Count", parent="histogram_y_axis", tag="annotation_histogram_series")
-                        dpg.add_drag_line(label="Current Frame", color=[255, 0, 0, 255], vertical=True, default_value=frame_idx, tag="current_frame_line")
+                        dpg.add_bar_series(list(range(video_metadata['num_frames'])), [0]*video_metadata['num_frames'], label="Human", parent="histogram_y_axis", tag="annotation_histogram_series")
+                        dpg.add_bar_series(list(range(video_metadata['num_frames'])), [0]*video_metadata['num_frames'], label="SLEAP", parent="histogram_y_axis", tag="sleap_histogram_series")
+                        dpg.add_drag_line(label="Current frame", color=[255, 0, 0, 255], vertical=True, default_value=frame_idx, tag="current_frame_line")
                     with dpg.item_handler_registry(tag="histogram_handler"):
                         dpg.add_item_clicked_handler(callback=on_histogram_click)
                     dpg.bind_item_handler_registry("annotation_plot", "histogram_handler")
@@ -1107,12 +1211,25 @@ def create_control_panel():
     # dpg.add_button(label="Track seed pose", callback=toggle_seed_pose_tracking, tag="seed_pose_tracking_button")
     dpg.add_button(label="Record", callback=toggle_record, tag="record_button")
     dpg.add_checkbox(label="Show histogram", default_value=True, callback=toggle_histogram)
+    dpg.add_checkbox(label="Show manual annotations", default_value=True, callback=toggle_manual_annotations)
+    dpg.add_checkbox(label="Show sleap annotations", default_value=False, callback=toggle_sleap_annotations)
+
     dpg.add_separator()
     dpg.add_text("--- Messages ---")
     dpg.add_text("", tag="status_message", color=(255, 100, 100), wrap=280, show=False)
     with dpg.group(horizontal=True):
         dpg.add_spacer(width=125)
         dpg.add_loading_indicator(tag="loading_indicator", show=False, style=1, speed=0.5)
+
+def calculate_manual_annotation_counts():
+    """Calculates the number of manual annotations for each frame."""
+    return np.sum(~np.isnan(annotations[:, :, :, 0]), axis=(1, 2))
+
+def calculate_sleap_annotation_counts():
+    """Calculates the number of SLEAP annotations for each frame."""
+    if sleap_annotations is None:
+        return np.zeros(video_metadata['num_frames'])
+    return np.sum(~np.isnan(sleap_annotations[:, :, :, 0]), axis=(1, 2))
 
 def create_video_grid(scene_viz: SceneVisualizer):
     """Creates the grid for video feeds and 3D projection."""
@@ -1261,7 +1378,7 @@ def add_to_calib_frames(sender, app_data, user_data):
 
 def image_click_callback(sender, app_data, user_data):
     """Callback function for handling mouse clicks on video images."""
-    global needs_3d_reconstruction, current_frames
+    global needs_3d_reconstruction, current_frames, sleap_annotations, annotations
     cam_idx = user_data
     image_tag = f"video_image_{cam_idx}"
     # Mouse pos in absolute window coords
@@ -1327,16 +1444,18 @@ def image_click_callback(sender, app_data, user_data):
                     needs_3d_reconstruction = True
         return  # Don't allow other functionality whilst estimating ground plane
 
-    if app_data[0] == 0:  # Left click to annotate
-        annotations[frame_idx, cam_idx, selected_point_idx] = (float(mouse_pos[0]), float(mouse_pos[1]))
-        human_annotated[frame_idx, cam_idx, selected_point_idx] = True
-        print(f"Annotated {POINT_NAMES[selected_point_idx]} at ({mouse_pos[0]:.2f}, {mouse_pos[1]:.2f}) in Cam {cam_idx} at frame {frame_idx}")
-        needs_3d_reconstruction = True
+    if app_data[0] == 0:  # Left click to annotate/move
+        if show_manual_annotations:
+            annotations[frame_idx, cam_idx, selected_point_idx] = (float(mouse_pos[0]), float(mouse_pos[1]))
+            human_annotated[frame_idx, cam_idx, selected_point_idx] = True
+            print(f"Annotated {POINT_NAMES[selected_point_idx]} at ({mouse_pos[0]:.2f}, {mouse_pos[1]:.2f}) in Cam {cam_idx} at frame {frame_idx}")
+            needs_3d_reconstruction = True
     elif app_data[0] == 1: # Right click to remove annotation
-        annotations[frame_idx, cam_idx, selected_point_idx] = np.nan
-        human_annotated[frame_idx, cam_idx, selected_point_idx] = False
-        print(f"Removed annotation for {POINT_NAMES[selected_point_idx]} in Cam {cam_idx} at frame {frame_idx}")
-        needs_3d_reconstruction = True
+        if show_manual_annotations:
+            annotations[frame_idx, cam_idx, selected_point_idx] = np.nan
+            human_annotated[frame_idx, cam_idx, selected_point_idx] = False
+            print(f"Removed annotation for {POINT_NAMES[selected_point_idx]} in Cam {cam_idx} at frame {frame_idx}")
+            needs_3d_reconstruction = True
 
 def clear_seed_points():
     """Clears all selected sam-segmented seed points."""
@@ -1519,6 +1638,16 @@ def toggle_histogram(sender, app_data, user_data):
         dpg.configure_item("video_grid_window", height=-150)
         dpg.show_item("histogram_window")
 
+def toggle_manual_annotations(sender, app_data, user_data):
+    global show_manual_annotations
+    show_manual_annotations = not show_manual_annotations
+    dpg.configure_item("annotation_histogram_series", show=app_data)
+
+def toggle_sleap_annotations(sender, app_data, user_data):
+    global show_sleap_annotations
+    show_sleap_annotations = not show_sleap_annotations
+    dpg.configure_item("sleap_histogram_series", show=app_data)
+
 def initialise_sam_model():
     """Loads the SAM model into memory and prepares it for inference."""
     global sam_predictor
@@ -1577,7 +1706,7 @@ def toggle_auto_segment_mode():
 
 def main_dpg():
     """Main loop for the DearPyGui application."""
-    global frame_idx, paused, needs_3d_reconstruction, best_individual, keypoint_tracking_enabled, seed_pose_tracking_enabled, focus_selected_point, save_output_video, current_frames
+    global frame_idx, paused, needs_3d_reconstruction, best_individual, keypoint_tracking_enabled, seed_pose_tracking_enabled, focus_selected_point, save_output_video, current_frames, scene_viz
     load_videos()
     load_state()
 
@@ -1613,15 +1742,19 @@ def main_dpg():
 
         # Update annotation histogram based on focus mode
         if focus_selected_point:
-            keypoint_annotation_counts = calculate_keypoint_annotation_counts(selected_point_idx)
+            manual_counts = np.sum(~np.isnan(annotations[:, :, selected_point_idx, 0]), axis=1)
+            sleap_counts = np.sum(~np.isnan(sleap_annotations[:, :, selected_point_idx, 0]), axis=1) if sleap_annotations is not None else np.zeros_like(manual_counts)
             dpg.configure_item("histogram_y_axis", label=f"'{POINT_NAMES[selected_point_idx]}'")
-            dpg.set_value("annotation_histogram_series", [list(range(video_metadata['num_frames'])), keypoint_annotation_counts.tolist()])
             dpg.set_axis_limits("histogram_y_axis", 0, video_metadata['num_videos'])
         else:
-            total_annotation_counts = calculate_annotation_counts()
-            dpg.configure_item("histogram_y_axis", label="Total annotations")
-            dpg.set_value("annotation_histogram_series", [list(range(video_metadata['num_frames'])), total_annotation_counts.tolist()])
-            dpg.set_axis_limits("histogram_y_axis", 0, max(total_annotation_counts.tolist()))
+            manual_counts = calculate_manual_annotation_counts()
+            sleap_counts = calculate_sleap_annotation_counts()
+            dpg.configure_item("histogram_y_axis", label="Total Annotations")
+            max_val = max(np.max(manual_counts) if len(manual_counts) > 0 else 0, 
+                          np.max(sleap_counts) if len(sleap_counts) > 0 else 0)
+            dpg.set_axis_limits("histogram_y_axis", 0, max_val * 1.1)
+        dpg.set_value("annotation_histogram_series", [list(range(video_metadata['num_frames'])), manual_counts.tolist()])
+        dpg.set_value("sleap_histogram_series", [list(range(video_metadata['num_frames'])), sleap_counts.tolist()])
 
         # Frame update logic
         current_frames = []
