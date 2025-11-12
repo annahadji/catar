@@ -11,21 +11,49 @@ import numpy as np
 import pathlib
 import pickle
 import json
-import random
 import itertools
 import re
-from pprint import pprint
 from tqdm import tqdm
-from typing import TypedDict, List, Tuple, Optional
-from viz_3d import SceneObject, SceneVisualizer
+from typing import List, Tuple, Optional
+from viz_3d import SceneObject, SceneVisualizer, create_camera_visual
 import dearpygui.dearpygui as dpg
 import tkinter as tk
 from scipy.spatial import ConvexHull
-from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation
 from segment_anything import sam_model_registry, SamPredictor
 import torch
 import sleap_io
+import trimesh
+import os  # Added for CoTracker
+import torch.nn.functional as F  # Added for CoTracker
+from cotracker.predictor import CoTrackerPredictor  # Added for CoTracker
+
+from calibration import (
+    CameraParams,
+    flat_individual,
+    unflat_individual,
+    get_projection_matrix,
+    undistort_points,
+    combination_triangulate,
+    reproject_points,
+    create_individual,
+    fitness,
+    permutation_optimisation,
+    calculate_all_reprojection_errors
+)
+
+from mesh import (
+    get_sam_segmentation,
+    translate_rotate_mesh_3d,
+    reproject_mesh_segmentation_as_contour,
+    resample_contour,
+    calculate_mesh_poses_from_axis,
+    scatter_pts_between,
+    get_intersections_with_mesh_surface,
+    calculate_change_between_poses,
+    pose_vec_to_matrix,
+    find_optimal_roll
+)
 
 np.set_printoptions(precision=3, suppress=True, linewidth=120)
 
@@ -75,6 +103,7 @@ POPULATION_SIZE = 200
 ELITISM_RATE = 0.1 # Keep the top 10%
 
 # Genetic algorithm state
+mean_params = None
 generation = 0
 train_ga = False
 best_fitness_so_far = float('inf')  # Initialize to a very high value
@@ -92,6 +121,7 @@ video_metadata = {
 }
 current_frames = []
 show_cameras = True
+show_seed_only = False
 
 # Data Structures
 # Shape: (num_frames, num_camera, num_points, 2) for (x, y) coordinates
@@ -119,12 +149,26 @@ reconstructed_seed_mesh = None
 seed_mesh_poses: np.ndarray = None  # (num_frames, 6) for (tvec, rvec) which is (tx, ty, tz, rx, ry, rz)
 initial_seed_axis_info = {}  # Stores the axis info of the seed mesh when initially reconstructed
 
+# CoTracker model
+cotracker_model = None
+COTRACKER_CHECKPOINT_PATH = DATA_FOLDER / "scaled_offline.pth"
+COTRACKER_SCALE_FACTOR = 0.3
+
+# Seed roll estimation state
+mesh_roll_estimation_mode = False
+mesh_roll_points_2d = []  # 2d randomly sampled points to track on seed
+mesh_roll_tracks = None  # Stores results from CoTracker
+mesh_rolls: np.ndarray = None
+intersection_points_3d = None
+predictions_3d = {}
+expected_3d_points = {}
+
 # Ground plane state
 ground_plane_mode = False
 ground_plane_data = None
 
 # UI and Control State
-frame_idx = 300
+frame_idx = 428 #300
 paused = True
 selected_point_idx = 0  # Default to P1
 focus_selected_point = False  # Whether to focus on the selected point in the visualisation
@@ -139,157 +183,37 @@ keypoint_tracking_enabled = False
 seed_pose_tracking_enabled = False
 
 point_colors = np.array([
-    [255, 0, 0],      # P1 - Red
-    [0, 255, 0],      # P2 - Green
-    [0, 0, 255],      # P3 - Blue
-    [255, 255, 0],    # P4 - Yellow
-    [0, 255, 255],    # P5 - Cyan
-    [255, 0, 255],    # P6 - Magenta
-    [192, 192, 192],  # P7 - Silver
-    [255, 128, 0],    # P8 - Orange
-    [128, 0, 255],    # P9 - Purple
-    [255, 128, 128],  # P10 - Light Red
-    [128, 128, 0],    # P11 - Olive
-    [0, 128, 128],    # P12 - Teal
-    [128, 0, 128],    # P13 - Maroon
-    [192, 128, 128],  # P14 - Salmon
-    [128, 192, 128],  # P15 - Light Green
-    [128, 128, 192],  # P16 - Light Blue
-    [192, 192, 128],  # P17 - Khaki
-    [192, 128, 192],  # P18 - Plum
-    [128, 192, 192],  # P19 - Light Cyan
-    [255, 255, 255],  # P20 - White
-    [0, 0, 0],        # P21 - Black
-    [128, 128, 128],  # P22 - Gray
-    [255, 128, 64],   # P23 - Light Orange
-    [128, 64, 255],   # P24 - Light Purple
-    [210, 105, 30],   # P25 - Chocolate
-    [128, 255, 64],   # P26 - Light Yellow
-    [128, 64, 0],     # P27 - Brown
-    [64, 128, 255]    # P28 - Light Blue
+    [255, 0, 0],     # P1 - Red
+    [0, 255, 0],     # P2 - Green
+    [0, 0, 255],     # P3 - Blue
+    [255, 255, 0],   # P4 - Yellow
+    [0, 255, 255],   # P5 - Cyan
+    [255, 0, 255],   # P6 - Magenta
+    [192, 192, 192], # P7 - Silver
+    [255, 128, 0],   # P8 - Orange
+    [128, 0, 255],   # P9 - Purple
+    [255, 128, 128], # P10 - Light Red
+    [128, 128, 0],   # P11 - Olive
+    [0, 128, 128],   # P12 - Teal
+    [128, 0, 128],   # P13 - Maroon
+    [192, 128, 128], # P14 - Salmon
+    [128, 192, 128], # P15 - Light Green
+    [128, 128, 192], # P16 - Light Blue
+    [192, 192, 128], # P17 - Khaki
+    [192, 128, 192], # P18 - Plum
+    [128, 192, 192], # P19 - Light Cyan
+    [255, 255, 255], # P20 - White
+    [0, 0, 0],       # P21 - Black
+    [128, 128, 128], # P22 - Gray
+    [255, 128, 64],  # P23 - Light Orange
+    [128, 64, 255],  # P24 - Light Purple
+    [210, 105, 30],  # P25 - Chocolate
+    [128, 255, 64],  # P26 - Light Yellow
+    [128, 64, 0],    # P27 - Brown
+    [64, 128, 255]   # P28 - Light Blue
 ], dtype=np.uint8)
-
 assert NUM_POINTS <= len(point_colors), "Not enough colours defined for the number of points."
 
-NUM_DIST_COEFFS = 14  # Number of distortion coefficients
-class CameraParams(TypedDict):
-    fx: float
-    fy: float
-    cx: float
-    cy: float
-    dist: np.ndarray
-    rvec: np.ndarray
-    tvec: np.ndarray
-
-def flat_camera_params(cam: CameraParams) -> np.ndarray:
-    """Returns a flattened array of camera parameters for genetic algorithm."""
-    """Flattens the CameraParams into a single array."""
-    return np.concatenate([
-        np.array([cam['fx'], cam['fy'], cam['cx'], cam['cy']], dtype=np.float32),
-        cam['dist'][:NUM_DIST_COEFFS].astype(np.float32),
-        cam['rvec'].astype(np.float32),
-        cam['tvec'].astype(np.float32)
-    ])
-
-def unflat_camera_params(cam: CameraParams, flattened: np.ndarray):
-    """Creates a CameraParams object from a flattened array."""
-    """Unflattens a single array into CameraParams."""
-    cam['fx'] = flattened[0]
-    cam['fy'] = flattened[1]
-    cam['cx'] = flattened[2]
-    cam['cy'] = flattened[3]
-    cam['dist'] = flattened[4:4 + NUM_DIST_COEFFS].astype(np.float32)
-    cam['rvec'] = flattened[4 + NUM_DIST_COEFFS:4 + NUM_DIST_COEFFS + 3].astype(np.float32)
-    cam['tvec'] = flattened[4 + NUM_DIST_COEFFS + 3:4 + NUM_DIST_COEFFS + 6].astype(np.float32)
-
-def flat_individual(individual: List[CameraParams]) -> np.ndarray:
-    """Flattens a list of CameraParams into a single array."""
-    return np.concatenate([flat_camera_params(cam) for cam in individual])
-
-def unflat_individual(flattened: np.ndarray) -> List[CameraParams]:
-    """Unflattens a single array into a list of CameraParams."""
-    cam_params_list = []
-    offset = 0
-    num_cameras = video_metadata['num_videos']
-    for _ in range(num_cameras):
-        cam_params = CameraParams(
-            fx=flattened[offset],
-            fy=flattened[offset + 1],
-            cx=flattened[offset + 2],
-            cy=flattened[offset + 3],
-            dist=flattened[offset + 4:offset + 4 + NUM_DIST_COEFFS],
-            rvec=flattened[offset + 4 + NUM_DIST_COEFFS:offset + 4 + NUM_DIST_COEFFS + 3],
-            tvec=flattened[offset + 4 + NUM_DIST_COEFFS + 3:offset + 4 + NUM_DIST_COEFFS + 6]
-        )
-        cam_params_list.append(cam_params)
-        offset += (4 + NUM_DIST_COEFFS + 6)  # Move to the next camera's parameters
-    return cam_params_list
-
-def get_camera_matrix(cam_params: CameraParams) -> np.ndarray:
-    """Constructs the camera matrix from camera parameters."""
-    K = np.array([[cam_params['fx'], 0, cam_params['cx']],
-                  [0, cam_params['fy'], cam_params['cy']],
-                  [0, 0, 1]], dtype=np.float32)
-    return K # (3, 3)
-
-def get_projection_matrix(cam_params: CameraParams) -> np.ndarray:
-    """Constructs the projection matrix from camera parameters."""
-    K = get_camera_matrix(cam_params)
-    R, _ = cv2.Rodrigues(cam_params['rvec'])
-    return K @ np.hstack((R, cam_params['tvec'].reshape(-1, 1))) # (3, 4)
-
-def undistort_points(points_2d: np.ndarray, cam_params: CameraParams) -> np.ndarray:
-    """Undistorts 2D points using camera parameters."""
-    # points_2d: (..., 2)
-    valid_points_mask = ~np.isnan(points_2d).any(axis=-1)  # Mask for valid points
-    if not np.any(valid_points_mask):
-        return np.full_like(points_2d, np.nan, dtype=np.float32)
-    valid_points = points_2d[valid_points_mask]  # Extract valid points (num_valid_points, 2)
-    undistorted_full = np.full_like(points_2d, np.nan, dtype=np.float32)  # Prepare output array with NaNs
-    # The following function returns normalised coordinates, not pixel coordinates
-    undistorted_points = cv2.undistortImagePoints(valid_points.reshape(-1, 1, 2), get_camera_matrix(cam_params), cam_params['dist']) # (num_valid_points, 1, 2)
-    undistorted_full[valid_points_mask] = undistorted_points.reshape(-1, 2)  # Fill only valid points
-    return undistorted_full  # Shape: (..., 2) with NaNs for invalid points
-
-def combination_triangulate(frame_annotations: np.ndarray, proj_matrices: np.ndarray) -> np.ndarray:
-    """Triangulates 3D points from 2D correspondences using multiple camera views."""
-    # frame_annotations: (num_frames, num_cams, num_points, 2) and proj_matrices: (num_cams, 3, 4)
-    # returns (points_3d: (num_frames, num_points, 3))
-    assert frame_annotations.shape[1] == proj_matrices.shape[0], "Number of cameras must match annotations."
-    combs = list(itertools.combinations(range(proj_matrices.shape[0]), 2))
-    # Every combination makes a prediction, some combinations may not have enough points to triangulate
-    points_3d = np.full((frame_annotations.shape[0], len(combs), frame_annotations.shape[2], 3), np.nan, dtype=np.float32)  # (num_frames, num_combs, num_points, 3)
-    for idx, (i, j) in enumerate(combs):
-        # Get 2D points from both cameras
-        p1_2d = frame_annotations[:, i] # (num_frames, num_points, 2)
-        p2_2d = frame_annotations[:, j] # (num_frames, num_points, 2)
-        common_mask = ~np.isnan(p1_2d).any(axis=2) & ~np.isnan(p2_2d).any(axis=2)  # (num_frames, num_points,)
-        if not np.any(common_mask):
-            continue
-        # Prepare 2D points for triangulation (requires shape [2, N])
-        p1_2d = p1_2d[common_mask] # (num_common_points, 2)
-        p2_2d = p2_2d[common_mask] # (num_common_points, 2)
-        # Expects (3, 4) project matrices and (2, N) points
-        points_4d_hom = cv2.triangulatePoints(proj_matrices[i], proj_matrices[j], p1_2d.T, p2_2d.T) # (4, num_common_points) homogenous coordinates
-        triangulated_3d = (points_4d_hom[:3] / points_4d_hom[3]).T  # Convert to 3D coordinates (num_common_points, 3)
-        points_3d[:, idx][common_mask] = triangulated_3d
-    # Average the triangulated points across all combinations
-    average = np.nanmean(points_3d, axis=1)  # (num_frames, num_points, 3)
-    return average
-
-def reproject_points(points_3d: np.ndarray, cam_params: CameraParams) -> np.ndarray:
-    """Reprojects 3D points back to 2D image plane using camera parameters."""
-    # points_3d: (N, 3)
-    # cam_params: CameraParams
-    points_3d = points_3d.reshape(-1, 1, 3)  # Shape: (N, 1, 3)
-    reprojected_pts_2d, _ = cv2.projectPoints(
-        points_3d, cam_params['rvec'], cam_params['tvec'], get_camera_matrix(cam_params), cam_params['dist']
-    )  # (N, 1, 2)
-    if reprojected_pts_2d is None:
-        raise ValueError("Reprojection failed, check camera parameters and 3D points.")
-    return reprojected_pts_2d.squeeze(axis=1)  # Shape: (N, 2)
-
-# --- Main Application Logic ---
 
 def load_videos():
     """Loads all videos from the specified data folder."""
@@ -319,7 +243,7 @@ def load_videos():
     video_metadata['num_frames'] = int(video_captures[0].get(cv2.CAP_PROP_FRAME_COUNT))
     video_metadata['fps'] = video_captures[0].get(cv2.CAP_PROP_FPS)
 
-    # Initialize data structures based on metadata
+    # Initialise data structures based on metadata
     annotations = np.full((video_metadata['num_frames'], video_metadata['num_videos'], NUM_POINTS, 2), np.nan, dtype=np.float32)
     reconstructed_3d_points = np.full((video_metadata['num_frames'], NUM_POINTS, 3), np.nan, dtype=np.float32)
     human_annotated = np.zeros((video_metadata['num_frames'], video_metadata['num_videos'], NUM_POINTS), dtype=bool)
@@ -333,6 +257,85 @@ def load_videos():
     sleap_annotations = np.full((video_metadata['num_frames'], video_metadata['num_videos'], NUM_POINTS, 2), np.nan, dtype=np.float32)
     print(f"Loaded {video_metadata['num_videos']} videos.")
     print(f"Resolution: {video_metadata['width']}x{video_metadata['height']}, Frames: {video_metadata['num_frames']}")
+
+def save_state():
+    """Saves the current state of annotations and 3D points."""
+    np.save(DATA_FOLDER / 'annotations.npy', annotations)
+    np.save(DATA_FOLDER / 'human_annotated.npy', human_annotated)
+    np.save(DATA_FOLDER / 'reconstructed_3d_points.npy', reconstructed_3d_points)
+    json.dump(calibration_frames, open(DATA_FOLDER / 'calibration_frames.json', 'w'))
+    if best_individual is not None:
+        with open(DATA_FOLDER / 'best_individual.pkl', 'wb') as f:
+            pickle.dump(best_individual, f)
+    if ground_plane_data is not None:
+        with open(DATA_FOLDER / 'ground_plane.pkl', 'wb') as f:
+            pickle.dump(ground_plane_data, f)
+    np.save(DATA_FOLDER / 'seed_mesh_poses.npy', seed_mesh_poses)
+    with open(DATA_FOLDER / 'initial_seed_axis_info.pkl', 'wb') as f:
+        pickle.dump(initial_seed_axis_info, f)
+    with open(DATA_FOLDER / 'reconstructed_seed_mesh.pkl', 'wb') as f:
+        pickle.dump(reconstructed_seed_mesh, f)
+    print("State saved successfully.")
+
+def load_state():
+    """Loads the saved state of annotations and 3D points."""
+    global annotations, human_annotated, reconstructed_3d_points, best_individual, best_fitness_so_far, calibration_frames, ground_plane_data
+    global seed_mesh_poses, initial_seed_axis_info, reconstructed_seed_mesh
+    try:
+        annotations = np.load(DATA_FOLDER / 'annotations.npy')
+        human_annotated = np.load(DATA_FOLDER / 'human_annotated.npy')
+        with open(DATA_FOLDER / 'calibration_frames.json', 'r') as f:
+            calibration_frames = json.load(f)
+        with open(DATA_FOLDER / 'best_individual.pkl', 'rb') as f:
+            best_individual = pickle.load(f)
+        best_fitness_so_far = fitness(best_individual, annotations, calibration_frames, human_annotated)  # Recalculate fitness
+        reconstructed_3d_points = np.load(DATA_FOLDER / 'reconstructed_3d_points.npy')
+        with open(DATA_FOLDER / 'ground_plane.pkl', 'rb') as f:
+            ground_plane_data = pickle.load(f)
+        seed_mesh_poses[:] = np.load(DATA_FOLDER / 'seed_mesh_poses.npy')
+        with open(DATA_FOLDER / 'initial_seed_axis_info.pkl', 'rb') as f:
+            initial_seed_axis_info = pickle.load(f)
+        with open(DATA_FOLDER / 'reconstructed_seed_mesh.pkl', 'rb') as f:
+            reconstructed_seed_mesh = pickle.load(f)
+        print("State loaded successfully.")
+    except FileNotFoundError as e:
+        print(f"Error loading state: {e}")
+
+def initialise_sam_model():
+    """Loads the SAM model into memory and prepares it for inference."""
+    global sam_predictor
+    if not SAM_MODEL_PATH.exists():
+        print(f"SAM model checkpoint not found at '{SAM_MODEL_PATH}'.")
+        print("Please download it and place it in the 'data' folder.")
+        return
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        sam = sam_model_registry["vit_b"](checkpoint=str(SAM_MODEL_PATH))
+        sam.to(device=device)
+        sam_predictor = SamPredictor(sam)
+    except Exception as e:
+        print(f"Error loading SAM model: {e}")
+        sam_predictor = None
+
+def initialise_cotracker_model():
+    """Loads the CoTracker model into memory."""
+    global cotracker_model
+    if not COTRACKER_CHECKPOINT_PATH.exists():
+        dpg.set_value("status_message", f"Error: cotracker checkpoint not found at {COTRACKER_CHECKPOINT_PATH}.")
+        dpg.show_item("status_message")
+        return
+    try:
+        cotracker_model = CoTrackerPredictor(checkpoint=COTRACKER_CHECKPOINT_PATH)
+        if torch.cuda.is_available():
+            cotracker_model = cotracker_model.cuda()
+        print("CoTracker model loaded successfully.")
+    except Exception as e:
+        print(f"Error loading CoTracker model: {e}")
+        cotracker_model = None
+        dpg.set_value("status_message", f"Error loading CoTracker model: {e}")
+        dpg.show_item("status_message")
+
+# --- Tracking ---
 
 def track_points(prev_gray, current_gray, cam_idx):
     """Tracks points from previous frame to current frame using Lucas-Kanade."""
@@ -360,179 +363,119 @@ def track_points(prev_gray, current_gray, cam_idx):
             if np.isnan(annotations[frame_idx, cam_idx, idx]).any() or not human_annotated[frame_idx, cam_idx, idx]:
                 annotations[frame_idx, cam_idx, idx] = good_new[i]
 
-
-# --- Genetic algorithm for camera calibration ---
-
-def create_individual() -> List[CameraParams]:
-    """Creates a single individual with a robust lookAt orientation."""
-    w, h = video_metadata['width'], video_metadata['height']
-    num_cameras = video_metadata['num_videos']
-    radius = 5  # Initial guess for camera distance from origin
-    individual = []
-    for i in range(num_cameras):
-        # Intrinsics
-        fx = random.uniform(w * 0.8, w * 1.5)
-        fy = random.uniform(h * 0.8, h * 1.5)
-        cx = w / 2 + random.uniform(-w * 0.05, w * 0.05)
-        cy = h / 2 + random.uniform(-h * 0.05, h * 0.05)
-        # Distortion (keep it small initially)
-        dist = np.random.normal(0.0, 0.001, size=NUM_DIST_COEFFS).astype(np.float32)
-        # Calculate tvec: position the camera in a circle
-        angle = (2 * np.pi / num_cameras) * i
-        x = radius * np.cos(angle) + random.uniform(-0.1, 0.1)
-        y = 2 + random.uniform(-0.5, 0.5)
-        z = radius * np.sin(angle) + random.uniform(-0.1, 0.1)
-        cam_in_world = np.array([x, y, z], dtype=np.float32)
-        # Calculate rvec: make the camera "look at" the target
-        # Forward vector (from camera to target)
-        # The point all cameras are looking at
-        target = np.array([0, 0, 0], dtype=np.float32)
-        world_up = np.array([0, 1, 0], dtype=np.float32)
-        forward = (target - cam_in_world) / np.linalg.norm(target - cam_in_world)
-        right = np.cross(forward, world_up)
-        right /= np.linalg.norm(right)
-        cap_up = np.cross(forward, right)
-
-        R = np.array([right, cap_up, forward])
-        rvec, _ = cv2.Rodrigues(R)  # Convert rotation matrix to rotation vector
-        tvec = -R @ cam_in_world  # Translation vector to move the camera to the origin
-        individual.append(CameraParams(fx=fx, fy=fy, cx=cx, cy=cy, dist=dist, rvec=rvec.flatten(), tvec=tvec.flatten()))
-    return individual
-
-def mutate(individual: List[CameraParams]) -> List[CameraParams]:
-    """Mutates an individual by applying small random changes."""
-    mutated = []
-    alpha = 0.01
-    for cam_params in individual:
-        # Mutate intrinsics
-        fx = cam_params['fx'] + np.random.normal(0, alpha)
-        fy = cam_params['fy'] + np.random.normal(0, alpha)
-        cx = cam_params['cx'] + np.random.normal(0, alpha)
-        cy = cam_params['cy'] + np.random.normal(0, alpha)
-        # Mutate distortion
-        dist = cam_params['dist'] + np.random.normal(0, alpha, size=cam_params['dist'].shape[0])
-        # Mutate extrinsics
-        rvec = cam_params['rvec'] + np.random.normal(0, np.pi/180, size=3)
-        tvec = cam_params['tvec'] + np.random.normal(0, alpha, size=3)
-        mutated.append(CameraParams(fx=fx, fy=fy, cx=cx, cy=cy, dist=dist, rvec=rvec, tvec=tvec))
-    # Anchor camera 0 to the origin
-    # mutated[0]['rvec'] = np.zeros(3, dtype=np.float32)  # No rotation
-    # mutated[0]['tvec'] = np.zeros(3, dtype=np.float32)  # No translation
-    return mutated
-
-def fitness(individual: List[CameraParams], annotations: np.ndarray):
-    """
-    Refactored fitness function that iterates frame-by-frame and processes points in batches.
-
-    This version calculates multiple triangulation points from pairs of cameras for a given valid frame.
-    Lower reprojection error results in a higher fitness score.
-    """
-    reprojection_errors = []
-    num_cams = annotations.shape[1]
-    # Get projection matrices and camera parameters once to avoid redundant calculations in the loop.
-    # We are ignoring the intrinsics because we undistort the points before triangulation.
-    proj_matrices = np.array([get_projection_matrix(i) for i in individual]) # (num_cams, 3, 4)
-
-    if len(calibration_frames) == 0:
-        dpg.set_value("status_message", "No calibration frames found / selected.")
+def run_mesh_roll_tracking(start_frame: int, points_2d: np.ndarray, cam_idx: int, num_frames: int = 50):
+    """Tracks 2D points over a video clip using CoTracker."""
+    global cotracker_model, mesh_roll_tracks, video_captures, video_metadata, mesh_rolls, seed_mesh_poses, intersection_points_3d, best_individual, predictions_3d
+    if cotracker_model is None:
+        initialise_cotracker_model()
+        if cotracker_model is None:
+            return
+    dpg.set_value("status_message", f"Running CoTracker for {num_frames} frames.")
+    dpg.show_item("status_message")
+    dpg.show_item("loading_indicator")
+    end_frame = min(start_frame + num_frames, video_metadata['num_frames'])
+    num_frames_to_track = end_frame - start_frame
+    if num_frames_to_track <= 0:
+        dpg.set_value("status_message", "Error: No frames to track.")
         dpg.show_item("status_message")
-        return float('inf')
-    # Find frames with at least one valid annotation to process.
-    valid_frames_mask = np.any(~np.isnan(annotations), axis=(1, 2, 3)) & np.any(human_annotated, axis=(1, 2)) # (num_frames,)
-    calibration_frames_mask = np.zeros_like(valid_frames_mask, dtype=bool)  # (num_frames,)
-    calibration_frames_mask[calibration_frames] = True  # Mark calibration frames as valid
-    valid_frames_mask = valid_frames_mask & calibration_frames_mask  # Only consider frames that are both valid and in the calibration set
-    valid_annotations = annotations[valid_frames_mask]  # (num_valid_frames, num_cams, num_points, 2)
-    undistorted_annotations = np.full_like(valid_annotations, np.nan, dtype=np.float32)  # (num_valid_frames, num_cams, num_points, 2)
+        dpg.hide_item("loading_indicator")
+        return
 
-    for c in range(num_cams):
-        undistorted_annotations[:, c] = undistort_points(valid_annotations[:, c], individual[c])  # (num_valid_frames, num_points, 2)
+    frames_to_track = []
+    cap = video_captures[cam_idx]
+    original_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    for f in range(num_frames_to_track):  # Extract appropriate frames
+        ret, frame = cap.read()
+        if not ret:
+            print(f"Warning: Could not read frame {start_frame + f}. Moving onto trackking.")
+            break
+        frames_to_track.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, original_pos)  # Restore original video pos
+    
+    # Update num_frames_to_track in case read failed early
+    num_frames_to_track = len(frames_to_track)
+    if num_frames_to_track == 0:
+        dpg.set_value("status_message", "Error: Could not read any frames for tracking.")
+        dpg.show_item("status_message")
+        dpg.hide_item("loading_indicator")
+        return
 
-    points_3d = combination_triangulate(undistorted_annotations, proj_matrices) # (num_valid_frames, num_points, 3)
-    valid_3d_mask = ~np.isnan(points_3d).any(axis=-1)  # (num_valid_frames, num_points)
-    for c in range(num_cams):
-        # Reproject 3d points back to 2d for this camera
-        valid_2d_mask = ~np.isnan(valid_annotations[:, c]).any(axis=-1)  # (num_valid_frames, num_points)
-        common_mask = valid_3d_mask & valid_2d_mask  # Points that are valid in both 3D and 2D
-        valid_3d_points = points_3d[common_mask]  # (num_common_points, 3)
-        valid_2d_points = valid_annotations[:, c][common_mask]  # (num_common_points, 2)
-        reprojected = reproject_points(valid_3d_points, individual[c]) # (num_common_points, 2)
-        # Calculate the reprojection error for valid points
-        error = np.linalg.norm(reprojected - valid_2d_points, axis=1)  # Euclidean distance, (num_common_points,)
-        reprojection_errors.extend(error)  # Append the error for this camera
+    # Downsample video frames
+    video_tensor = torch.from_numpy(np.stack(frames_to_track)).permute(0, 3, 1, 2)[None].float() # (1, T, C, H, W)
+    B, T, C, H, W = video_tensor.shape
+    video_tensor_reshaped = video_tensor.view(B * T, C, H, W)
+    video_tensor_downsampled = F.interpolate(video_tensor_reshaped, scale_factor=COTRACKER_SCALE_FACTOR, mode='bilinear', align_corners=False)
+    _, C_new, H_new, W_new = video_tensor_downsampled.shape
+    video_tensor_downsampled = video_tensor_downsampled.view(B, T, C_new, H_new, W_new)
+    print(f"Downsampled video from {video_tensor.shape} to {video_tensor_downsampled.shape}")
+    
+    # Create 3D scaled queries for model from 2D points    
+    scaled_points_np = (np.array(points_2d) + 0.5) * COTRACKER_SCALE_FACTOR - 0.5
+    queries_list = [[0, p[0], p[1]] for p in scaled_points_np]
+    queries = torch.tensor(queries_list).float()[None] # (1, N, 3)
+    if torch.cuda.is_available():
+        video_tensor_downsampled = video_tensor_downsampled.cuda()
+        queries = queries.cuda()
 
-    if len(reprojection_errors) == 0:
-        return float('inf')  # No valid points to evaluate
+    try:
+        with torch.no_grad():
+            pred_tracks, pred_visibility = cotracker_model(video_tensor_downsampled, queries=queries, backward_tracking=True)  # (1, T, N, 2), (1, T, N)
+        # Upscale tracks
+        pred_tracks = pred_tracks.squeeze(0).cpu().numpy() # (T, N, 2)
+        pred_visibility = pred_visibility.squeeze(0).cpu().numpy() # (T, N)
+        pred_tracks_upscaled = (pred_tracks + 0.5) / COTRACKER_SCALE_FACTOR - 0.5
+        mesh_roll_tracks = {
+            'start_frame': start_frame,
+            'cam_idx': cam_idx,
+            'tracks': pred_tracks_upscaled, # (T, N, 2)
+            'visibility': pred_visibility # (T, N)
+        }
+        print("Tracking complete.")
+        dpg.set_value("status_message", f"Seed points tracking complete. Found {len(points_2d)} tracks.")
+        dpg.show_item("status_message")
 
-    # average_error = total_reprojection_error / points_evaluated
-    average_error = np.sum(reprojection_errors)
-    # print("Descriptive statistics of reprojection errors:")
-    # print(f"  Min: {np.min(reprojection_errors):.2f}, Max: {np.max(reprojection_errors):.2f}, Mean: {average_error:.2f}, Std Dev: {np.std(reprojection_errors):.2f}")
-    return average_error  # Fitness is the error
+        start_pose = seed_mesh_poses[start_frame]  # Pose of seed relative to its pose when it was first reconstructed
+        for t in range(1, num_frames_to_track):
+            f = start_frame + t
+            if f >= video_metadata['num_frames']:
+                break
+            change_pose = calculate_change_between_poses(start_pose, seed_mesh_poses[f])
+            expected_3d_points[f] = translate_rotate_mesh_3d(change_pose, intersection_points_3d)
+            points_2d_predictions = mesh_roll_tracks['tracks'][t]  # TODO: consider filtering these for which are visible?
+            predictions_3d[f], intersection_mask = get_intersections_with_mesh_surface(best_individual[cam_idx], points_2d_predictions, reconstructed_seed_mesh, seed_mesh_poses[f])
+            expected_3d_points[f] = expected_3d_points[f][intersection_mask]
+            # Estimate the optimal roll angle of the seed that minimises the discrepency between the query and tracked points
+            s_small_3d = reconstructed_3d_points[f, POINT_NAMES.index('s_small')]
+            s_large_3d = reconstructed_3d_points[f, POINT_NAMES.index('s_large')]
+            axis_centre = (s_small_3d + s_large_3d) / 2 # To rotate around
+            axis_vec = s_large_3d - s_small_3d
+            axis_vec_norm = axis_vec / np.linalg.norm(axis_vec)  # Roll axis
+            roll_angle, min_err = find_optimal_roll(expected_3d_points[f], predictions_3d[f], axis_vec_norm, axis_centre)
+            print("Frame", f, "Estimated roll:", np.round(np.degrees(roll_angle),2), "Err:", np.round(min_err,2))
+            # Update seed pose with roll
+            pose_vec_base = seed_mesh_poses[f]
+            tvec_base, rvec_base = pose_vec_base[:3], pose_vec_base[3:]
+            R_base, _ = cv2.Rodrigues(rvec_base)
+            roll_rotation = Rotation.from_rotvec(roll_angle * axis_vec_norm)
+            R_roll = roll_rotation.as_matrix() # 3x3
+            R_new = R_roll @ R_base
+            rvec_new, _ = cv2.Rodrigues(R_new)
+            tvec_new = R_roll @ (tvec_base - axis_centre) + axis_centre
+            seed_mesh_poses[f] = np.hstack((tvec_new.flatten(), rvec_new.flatten()))
+    except Exception as e:
+        print(f"Error during CoTracker inference or roll estimation: {e}")
+        dpg.set_value("status_message", f"Error during tracking: {e}")
+        dpg.show_item("status_message")
+    finally:
+        dpg.hide_item("loading_indicator")
 
-def calculate_all_reprojection_errors() -> List[dict]:
-    """Finds the top_k worst reprojection errors across all frames, cameras, and points."""
-    if 'best_individual' not in globals() or best_individual is None:
-        print("Optimized camera parameters ('best_individual') not found.")
-        return []
-    # Compute reconstruction
-    undistorted_annotations = np.full_like(annotations, np.nan, dtype=np.float32)  # (frames, num_cams, num_points, 2)
-    for c in range(video_metadata['num_videos']):
-        undistorted_annotations[:, c] = undistort_points(annotations[:, c], best_individual[c])  # (frames, num_points, 2)
-    proj_matrices = np.array([get_projection_matrix(i) for i in best_individual])
-    points_3d = combination_triangulate(undistorted_annotations, proj_matrices) # (frames, num_points, 3)
-    reconstructed_3d_points[:] = points_3d  # Update the global 3D points for this frame
-
-    all_errors = []
-    # Pre-calculate masks for valid 3D points and 2D annotations to avoid re-computation
-    valid_3d_mask = ~np.isnan(reconstructed_3d_points).any(axis=-1)  # Shape: (num_frames, num_points)
-    valid_2d_mask = ~np.isnan(annotations).any(axis=-1)  # Shape: (num_frames, num_cams, num_points)
-
-    # Iterate over each camera to calculate its reprojection errors
-    for cam_idx in range(video_metadata['num_videos']):
-        # Find points that are valid in both the 3D data and this camera's 2D annotations
-        common_mask = valid_3d_mask & valid_2d_mask[:, cam_idx]
-        # Get the (frame_idx, point_idx) coordinates for all valid points
-        frame_indices, point_indices = np.where(common_mask)
-        # If no valid points exist for this camera, skip to the next one
-        if frame_indices.size == 0:
-            continue
-
-        # Select the corresponding 3D points and 2D ground truth annotations
-        points_3d = reconstructed_3d_points[frame_indices, point_indices]
-        points_2d = annotations[frame_indices, cam_idx, point_indices]
-        # Reproject the 3D points onto the current camera's 2D image plane
-        reprojected_points = reproject_points(points_3d, best_individual[cam_idx]) # (num_valid_points, 2)
-
-        valid_reprojection_mask = (reprojected_points[:, 0] >= 0) & (reprojected_points[:, 0] < video_metadata['width']) & \
-                                  (reprojected_points[:, 1] >= 0) & (reprojected_points[:, 1] < video_metadata['height'])
-        # Filter out points that are outside the image bounds
-        reprojected_points = reprojected_points[valid_reprojection_mask]
-        points_2d = points_2d[valid_reprojection_mask]
-        frame_indices = frame_indices[valid_reprojection_mask]
-        point_indices = point_indices[valid_reprojection_mask]
-        # Calculate the Euclidean distance (L2 norm) between reprojected and annotated points
-        errors = np.square(reprojected_points - points_2d)
-        errors = np.sqrt(np.sum(errors, axis=-1))  # Shape: (num_valid_points,)
-        # Store each error along with its full context (frame, camera, point index)
-        for i in range(len(errors)):
-            all_errors.append({
-                'error': float(errors[i]),
-                'frame': int(frame_indices[i]),
-                'camera': video_names[cam_idx],
-                'point': POINT_NAMES[point_indices[i]],
-                'annotated_point': annotations[frame_indices[i], cam_idx, point_indices[i]].tolist(),
-                'reprojected_point': reprojected_points[i].tolist(),
-                '3d_point': points_3d[i].tolist()
-            })
-
-    # Sort the collected errors in descending order to find the largest ones
-    sorted_errors = sorted(all_errors, key=lambda x: x['error'], reverse=True)
-    return sorted_errors
+# --- Camera calibration ---
 
 def find_worst_frame():
-    """Finds the frame with the worst total reprojection error."""
-    sorted_errors = calculate_all_reprojection_errors()
+    """Find and move to frame with the worst total reprojection error."""
+    global frame_idx
+    sorted_errors = calculate_all_reprojection_errors(video_metadata, video_names, POINT_NAMES, best_individual, annotations, reconstructed_3d_points)
     frame_errors = {}
     for e in sorted_errors:
         if e['frame'] in calibration_frames:
@@ -540,9 +483,6 @@ def find_worst_frame():
         frame_errors.setdefault(e['frame'], 0)
         frame_errors[e['frame']] += e['error']
     sorted_frame_errors = sorted(frame_errors.items(), key=lambda x: x[1], reverse=True) # (frame, total_error)
-    print("Worst frames by total reprojection error:")
-    pprint(sorted_frame_errors[:10])  # Print top 10 worst frames
-    global frame_idx
     frame_idx = sorted_frame_errors[0][0] if sorted_frame_errors else 0
     dpg.set_value("frame_slider", frame_idx)
     message = (f"Worst frames by total reprojection error (frame, error):\n"
@@ -552,13 +492,11 @@ def find_worst_frame():
     dpg.show_item("status_message")
 
 def find_worst_reprojection():
-    sorted_errors = calculate_all_reprojection_errors()
-    # Compute mean error across all cameras and points
-    mean_error = np.mean([e['error'] for e in sorted_errors])
-    print(f"Mean reprojection error across all cameras and points: {mean_error:.2f}")
+    """Find and move to frame with the worst reprojection error across all cameras and points."""
     global frame_idx, selected_point_idx
+    sorted_errors = calculate_all_reprojection_errors(video_metadata, video_names, POINT_NAMES, best_individual, annotations, reconstructed_3d_points)
+    mean_error = np.mean([e['error'] for e in sorted_errors])  # Across all cameras and points
     if len(sorted_errors) > 0:
-        pprint(sorted_errors[0])
         frame_idx = sorted_errors[0]['frame']
         selected_point_idx = POINT_NAMES.index(sorted_errors[0]['point'])
         dpg.set_value("frame_slider", frame_idx)
@@ -570,21 +508,9 @@ def find_worst_reprojection():
         dpg.set_value("status_message", message)
         dpg.show_item("status_message")
 
-def permutation_optimization(individual: List[CameraParams]):
-    """It may at random initialisation the order of cameras are not optimal
-    forcing the GA to move a camera across the scene instead of picking one that
-    is already in a good position."""
-    # Evaluate the fitness of the current individual for every permutation
-    perms = list(itertools.permutations(individual))
-    fitness_scores = np.array([fitness(list(p), annotations) for p in perms]) # (num_permutations,)
-    best_perm = perms[np.argmin(fitness_scores)]
-    individual[:] = list(best_perm)  # Update the individual with the best permutation
-
-mean_params = None
 def run_genetic_step():
-    """The main loop for the genetic algorithm to find best camera parameters."""
+    """The main loop for the genetic algorithm to determine the best camera parameters."""
     global best_fitness_so_far, best_individual, generation, mean_params
-
     # Check if there are enough annotations
     num_annotations = np.sum(~np.isnan(annotations))
     if num_annotations < (2 * NUM_POINTS * 2): # Need at least 2 points in 2 views
@@ -600,9 +526,9 @@ def run_genetic_step():
         dpg.set_value("ga_progress_text", "")
         dpg.render_dearpygui_frame()
         # Initialise the population with random individuals
-        population = [create_individual() for _ in range(POPULATION_SIZE)]
+        population = [create_individual(video_metadata) for _ in range(POPULATION_SIZE)]
         for i in tqdm(population, desc="Finding optimal initial permutation"):
-            permutation_optimization(i)
+            permutation_optimisation(i, annotations, calibration_frames, human_annotated)
         best_fitness_so_far = float('inf')  # Initialise to a very high value
         best_individual = None
         pop_fitness = np.array([fitness(ind, annotations) for ind in population])  # (Population,)
@@ -613,16 +539,16 @@ def run_genetic_step():
     noise = np.random.normal(0, std_dev, size=(POPULATION_SIZE, num_params))  # (Population, num_params)
     pop_params = noise + mean_params # Add noise to the best parameters for exploration (Population, num_params)
     fitness_scores = np.zeros(POPULATION_SIZE, dtype=np.float32)  # (Population,)
-    temp_individual = create_individual()
+    temp_individual = create_individual(video_metadata)
     for i in range(POPULATION_SIZE):
-        temp_individual = unflat_individual(pop_params[i])  # Unflatten the parameters
+        temp_individual = unflat_individual(pop_params[i], video_metadata['num_videos'])  # Unflatten the parameters
         fitness_scores[i] = fitness(temp_individual, annotations)  # Calculate fitness for the individual
 
     # Selection (elitism + tournament)
     sorted_population_indices = np.argsort(fitness_scores)  # Sort in ascending order
     if fitness_scores[sorted_population_indices[0]] < best_fitness_so_far:
         best_fitness_so_far = fitness_scores[sorted_population_indices[0]]
-        best_individual = unflat_individual(pop_params[sorted_population_indices[0]])  # Update the best individual
+        best_individual = unflat_individual(pop_params[sorted_population_indices[0]], video_metadata['num_videos'])  # Update the best individual
     dpg.set_value("ga_progress_text", f"Generation {generation}: Best fitness (err): {best_fitness_so_far:.2f} Mean error: {np.nanmean(fitness_scores):.2f} SD: {np.nanstd(fitness_scores):.2f}")
     normalised_scores = (fitness_scores - np.nanmean(fitness_scores)) / (np.nanstd(fitness_scores) + 1e-8)  # Normalize scores
     # Update based on evolution strategy
@@ -630,7 +556,7 @@ def run_genetic_step():
     generation += 1
 
 def update_3d_reconstruction(best_params: List[CameraParams]):
-    """Uses the best camera parameters to reconstruct all 3D points in the current frame."""
+    """Use the best camera parameters to reconstruct all 3D points in the current frame."""
     proj_matrices = np.array([get_projection_matrix(i) for i in best_params])
     frame_annotations = annotations[frame_idx]  # (num_cams, num_points, 2)
     undistorted_annotations = np.full_like(frame_annotations, np.nan, dtype=np.float32)  # (num_cams, num_points, 2)
@@ -638,124 +564,6 @@ def update_3d_reconstruction(best_params: List[CameraParams]):
         undistorted_annotations[c] = undistort_points(frame_annotations[c], best_params[c])  # (num_points, 2)
     points_3d = combination_triangulate(frame_annotations[None], proj_matrices)[0]  # (num_points, 3)
     reconstructed_3d_points[frame_idx] = points_3d  # Update the global 3D points for this frame
-
-# --- Segmentation ---
-
-def translate_rotate_seed_mesh_3d(pose: np.ndarray) -> np.ndarray:
-    """Translates and rotates the seed mesh points based on the current frame's seed mesh pose."""
-    # pose (6,) tx, ty, tz, rx, ry, rz
-    if reconstructed_seed_mesh is None:
-        return
-    points_3d = reconstructed_seed_mesh['points']  # (points, 3)
-    tvec = pose[:3]
-    rvec = pose[3:]
-    R, _ = cv2.Rodrigues(rvec)
-    transformed_points = (R @ points_3d.T).T + tvec
-    return transformed_points  # (points, 3)
-
-def reproject_seed_segmentation_as_contour(cam_idx: int, pose: np.ndarray) -> np.ndarray:
-    """Reproject 2d seed contour (shadow) from 3d reconstructed mesh."""
-    if reconstructed_seed_mesh is None or best_individual is None:
-        return
-    points_3d = translate_rotate_seed_mesh_3d(pose) # (points, 3)
-    vertex_points_3d = points_3d[reconstructed_seed_mesh['vertices']] # (vertices, 3)
-    reprojected = reproject_points(vertex_points_3d, best_individual[cam_idx]) # (vertices, 2)
-    hull = ConvexHull(reprojected)
-    hull = reprojected[hull.vertices]  # (hull_points, 2)
-    return hull
-
-def resample_contour(contour: np.ndarray, num_points: int) -> np.ndarray:
-    """Resamples a 2D contour to have a specific number of points."""
-    closed_contour = np.vstack([contour, contour[0]])
-    distances = np.cumsum(np.sqrt(np.sum(np.diff(closed_contour, axis=0)**2, axis=1)))
-    distances = np.insert(distances, 0, 0)
-    total_length = distances[-1]
-    if total_length < 1e-6: # Handle case of single or identical points
-        return np.repeat(contour[:1], num_points, axis=0)
-    resampled_distances = np.linspace(0, total_length, num_points, endpoint=False) # Use endpoint=False for closed loop
-    resampled_x = np.interp(resampled_distances, distances, closed_contour[:, 0])
-    resampled_y = np.interp(resampled_distances, distances, closed_contour[:, 1])
-    return np.vstack((resampled_x, resampled_y)).T
-
-def estimate_seed_pose():
-    """Estimates the seed mesh pose for the current frame using PnP."""
-    if reconstructed_seed_mesh is None or best_individual is None:
-        return
-    def calc_error(pose: np.ndarray) -> float:
-        cameras_with_seed_segmentation = [i for i, seeds in enumerate(seed_points_2d) if len(seeds) > 0]
-        total_error = 0
-        count = 0
-        for i in cameras_with_seed_segmentation:
-            contour_2d = reproject_seed_segmentation_as_contour(i, pose)
-            if contour_2d is None or len(contour_2d) < 5:
-                continue
-            seed_2d = np.array(seed_points_2d[i], dtype=np.float32)
-            if len(seed_2d) < 5:
-                continue
-            # Resample both contours to a fixed number of points
-            resampled_projected = resample_contour(contour_2d, 100)
-            resampled_observed = resample_contour(seed_2d, 100)
-            # Find the best alignment by shifting the starting point
-            best_error_for_cam = float('inf')
-            for offset in range(len(resampled_projected)):
-                rolled_contour = np.roll(resampled_projected, offset, axis=0)
-                pointwise_distances = np.linalg.norm(resampled_observed - rolled_contour, axis=1)
-                # Use the 90th percentile instead of the mean to ignore the worst 10% of errors (outliers)
-                error = np.percentile(pointwise_distances, 90)
-                if error < best_error_for_cam:
-                    best_error_for_cam = error
-            total_error += best_error_for_cam
-            count += 1
-        print("Total robust seed reprojection error:", total_error, "Count:", count, "pose", pose)
-        return total_error / count if count > 0 else float('inf')
-    # Initial guess for pose
-    initial_pose = seed_mesh_poses[frame_idx]
-    print("Optimizing seed mesh pose for frame", frame_idx)
-    result = minimize(calc_error, initial_pose, method='Nelder-Mead', options={'maxiter': 1000, 'xatol': 1e-2, 'fatol': 1e-2, 'disp': False})
-    print("Result", result)
-    if result.success:
-        seed_mesh_poses[frame_idx] = result.x
-    else:
-        print("Seed mesh pose optimisation failed for frame", frame_idx)
-
-def toggle_ground_plane():
-    """Toggles the ground plane estimation mode."""
-    global ground_plane_mode
-    ground_plane_mode = not ground_plane_mode
-    if ground_plane_mode:
-        dpg.set_value("status_message", "Select four points on the ground plane in at least two views (in the same order).")
-        dpg.show_item("status_message")
-        for i in range(video_metadata['num_videos']):
-            ground_plane_data['points_2d'][i].clear()  # Clear previous points
-    else:
-        dpg.hide_item("status_message")
-
-def draw_ground_plane(scene: list):
-    """Adds the ground plane visualization to the 3D scene."""
-    normal = ground_plane_data['plane_model']['normal']
-    d = ground_plane_data['plane_model']['d']    
-    # Create a large rectangle on the estimated plane
-    if np.allclose(normal, [0, 1, 0]) or np.allclose(normal, [0, -1, 0]):
-        u = np.array([1, 0, 0])
-    else:
-        u = np.cross(normal, [0, 1, 0])
-    u /= np.linalg.norm(u)
-    v = np.cross(normal, u)
-    v /= np.linalg.norm(v)
-    # Center of the plane (can be approximated from the points used for estimation)
-    # For now, let's assume it's around the origin for simplicity
-    center = -d * normal # A point on the plane
-
-    size = 1.5 # Size of the rectangle
-    p1 = center + size * u + size * v
-    p2 = center - size * u + size * v
-    p3 = center - size * u - size * v
-    p4 = center + size * u - size * v
-    color = (128, 128, 128, 200)
-    scene.append(SceneObject(type='line', coords=np.array([p1, p2]), color=color, label=None))
-    scene.append(SceneObject(type='line', coords=np.array([p2, p3]), color=color, label=None))
-    scene.append(SceneObject(type='line', coords=np.array([p3, p4]), color=color, label=None))
-    scene.append(SceneObject(type='line', coords=np.array([p4, p1]), color=color, label=None))
 
 # --- Visualisation ---
 
@@ -799,7 +607,7 @@ def draw_ui(frame, cam_idx):
 
     # Draw 3D reconstructed mesh reprojected back down to 2D cameras
     if reconstructed_seed_mesh is not None and best_individual is not None and frame_idx >= initial_seed_axis_info.get('frame_idx', -1):
-        contour_2d = reproject_seed_segmentation_as_contour(cam_idx, seed_mesh_poses[frame_idx])
+        contour_2d = reproject_mesh_segmentation_as_contour(cam_idx, seed_mesh_poses[frame_idx], reconstructed_seed_mesh, best_individual)
         if contour_2d is not None and len(contour_2d) > 0:
             cv2.drawContours(frame, [contour_2d.astype(np.int32)], -1, (0, 255, 0), 1)
 
@@ -814,194 +622,60 @@ def draw_ui(frame, cam_idx):
         for point in ground_plane_data['points_2d'][cam_idx]:
             cv2.circle(frame, tuple(np.array(point, dtype=int)), 5, (0, 255, 0), -1)
 
+    # Draw current points for mesh roll estimation
+    if mesh_roll_estimation_mode and cam_idx == 3:
+        show = True
+        if mesh_roll_tracks is not None:
+            start_frame = mesh_roll_tracks['start_frame']
+            if (frame_idx - start_frame) >= 1:
+                show = False
+        if show:
+            for point in mesh_roll_points_2d:
+                cv2.circle(frame, tuple(np.array(point, dtype=int)), 5, (0, 255, 0), -1)   
+
+    # Draw cotracker points
+    if mesh_roll_tracks is not None and cam_idx == mesh_roll_tracks['cam_idx']:
+        start_frame = mesh_roll_tracks['start_frame']
+        num_tracked_frames = mesh_roll_tracks['tracks'].shape[0] # T
+        if start_frame <= frame_idx < start_frame + num_tracked_frames:
+            track_frame_idx = frame_idx - start_frame
+            tracks_at_frame = mesh_roll_tracks['tracks'][track_frame_idx, :, :] # (N, 2)
+            visibility_at_frame = mesh_roll_tracks['visibility'][track_frame_idx, :] # (N,)
+            # Cotracker recommend > 0.8 for "good" points
+            visibility_threshold = 0.8 
+            for i, point_xy in enumerate(tracks_at_frame):
+                if visibility_at_frame[i] > visibility_threshold: # Check visibility
+                    # Draw tracked points in red
+                    cv2.circle(frame, tuple(np.array(point_xy, dtype=int)), 3, (0, 0, 255), -1)
     return frame
 
-def create_camera_visual(
-    cam_params: CameraParams,
-    scale: float = 1.0,
-    color: Tuple[int, int, int] = (255, 255, 0),
-    label: Optional[str] = None
-) -> List[SceneObject]:
-    """
-    Generates a list of SceneObjects to represent a camera's pose as a pyramid.
+def draw_ground_plane(scene: list):
+    """Adds the ground plane visualization to the 3D scene."""
+    normal = ground_plane_data['plane_model']['normal']
+    d = ground_plane_data['plane_model']['d']   
+    # Create a large rectangle on the estimated plane
+    if np.allclose(normal, [0, 1, 0]) or np.allclose(normal, [0, -1, 0]):
+        u = np.array([1, 0, 0])
+    else:
+        u = np.cross(normal, [0, 1, 0])
+    u /= np.linalg.norm(u)
+    v = np.cross(normal, u)
+    v /= np.linalg.norm(v)
+    # Center of the plane (can be approximated from the points used for estimation)
+    # For now, let's assume it's around the origin for simplicity
+    center = -d * normal # A point on the plane
+    size = 1.5 # Size of the rectangle
+    p1 = center + size * u + size * v
+    p2 = center - size * u + size * v
+    p3 = center - size * u - size * v
+    p4 = center + size * u - size * v
+    color = (128, 128, 128, 200)
+    scene.append(SceneObject(type='line', coords=np.array([p1, p2]), color=color, label=None))
+    scene.append(SceneObject(type='line', coords=np.array([p2, p3]), color=color, label=None))
+    scene.append(SceneObject(type='line', coords=np.array([p3, p4]), color=color, label=None))
+    scene.append(SceneObject(type='line', coords=np.array([p4, p1]), color=color, label=None))
 
-    The function computes the camera's world position from its extrinsic parameters
-    (which define the world-to-camera transformation) and then transforms a
-    canonical pyramid shape from the camera's local coordinates into world coordinates.
-
-    Args:
-        cam_params: The camera's parameters, containing rvec and tvec.
-        scale: The size of the rendered pyramid.
-        color: The color for the camera visualization.
-        label: An optional label displayed at the camera's center.
-
-    Returns:
-        A list of SceneObjects representing the camera.
-    """
-    # Extrinsic parameters (world-to-camera transformation)
-    rvec = cam_params['rvec'] # (3,)
-    tvec = cam_params['tvec'] # (3,)
-    # Get camera-to-world rotation matrix (inverse of world-to-camera)
-    R, _ = cv2.Rodrigues(rvec) # (3, 3)
-    # Define canonical camera pyramid in its local coordinate system
-    #  (apex at the origin, pointing down the +Z axis)
-    #  Note: OpenCV's camera convention is +Y down, +X right.
-    w = 0.5 * scale
-    h = 0.4 * scale
-    depth = 0.8 * scale
-
-    # Points in the camera's local coordinate system
-    pyramid_points_cam = np.array([
-        [0, 0, 0],       # p0: Apex (camera center)
-        [-w, -h, depth], # p1: Top-left corner of base
-        [w, -h, depth],  # p2: Top-right corner
-        [w, h, depth],   # p3: Bottom-right corner
-        [-w, h, depth],  # p4: Bottom-left corner
-    ]) # (5, 3) - points in camera local coordinates
-
-    # 4. Transform local camera points to world coordinates.
-    # The camera center in the world is C = -R' * t
-    # A point in the world is p_w = C + R' * p_c = R' * (p_c - t)
-    cam_center_world = -R.T @ tvec # (3,)
-    pyramid_points_world = (pyramid_points_cam - tvec) @ R # (5, 3)
-    p0_w, p1_w, p2_w, p3_w, p4_w = pyramid_points_world
-    scene_objects: List[SceneObject] = []
-
-    # Camera center
-    scene_objects.append(SceneObject(type='point', coords=cam_center_world, color=color, label=label))
-
-    # Pyramid edges (from apex to base corners)
-    scene_objects.append(SceneObject(type='line', coords=np.array([p0_w, p1_w]), color=color, label=None))
-    scene_objects.append(SceneObject(type='line', coords=np.array([p0_w, p2_w]), color=color, label=None))
-    scene_objects.append(SceneObject(type='line', coords=np.array([p0_w, p3_w]), color=color, label=None))
-    scene_objects.append(SceneObject(type='line', coords=np.array([p0_w, p4_w]), color=color, label=None))
-
-    # Pyramid base
-    scene_objects.append(SceneObject(type='line', coords=np.array([p1_w, p2_w]), color=color, label=None))
-    scene_objects.append(SceneObject(type='line', coords=np.array([p2_w, p3_w]), color=color, label=None))
-    scene_objects.append(SceneObject(type='line', coords=np.array([p3_w, p4_w]), color=color, label=None))
-    scene_objects.append(SceneObject(type='line', coords=np.array([p4_w, p1_w]), color=color, label=None))
-
-    # Add a line to indicate the 'up' direction (+Y is down in camera coords)
-    up_color = (255, 255, 255) # White for the 'up' vector
-    scene_objects.append(SceneObject(type='line', coords=np.array([p1_w, p2_w]), color=up_color, label=None))
-    return scene_objects
-
-def save_state():
-    """Saves the current state of annotations and 3D points."""
-    np.save(DATA_FOLDER / 'annotations.npy', annotations)
-    np.save(DATA_FOLDER / 'human_annotated.npy', human_annotated)
-    np.save(DATA_FOLDER / 'reconstructed_3d_points.npy', reconstructed_3d_points)
-    json.dump(calibration_frames, open(DATA_FOLDER / 'calibration_frames.json', 'w'))
-    if best_individual is not None:
-        with open(DATA_FOLDER / 'best_individual.pkl', 'wb') as f:
-            pickle.dump(best_individual, f)
-    if ground_plane_data is not None:
-        with open(DATA_FOLDER / 'ground_plane.pkl', 'wb') as f:
-            pickle.dump(ground_plane_data, f)
-    np.save(DATA_FOLDER / 'seed_mesh_poses.npy', seed_mesh_poses)
-    with open(DATA_FOLDER / 'initial_seed_axis_info.pkl', 'wb') as f:
-        pickle.dump(initial_seed_axis_info, f)
-    with open(DATA_FOLDER / 'reconstructed_seed_mesh.pkl', 'wb') as f:
-        pickle.dump(reconstructed_seed_mesh, f)
-    print("State saved successfully.")
-
-def load_state():
-    """Loads the saved state of annotations and 3D points."""
-    global annotations, human_annotated, reconstructed_3d_points, best_individual, best_fitness_so_far, calibration_frames, ground_plane_data
-    global seed_mesh_poses, initial_seed_axis_info, reconstructed_seed_mesh
-    try:
-        annotations = np.load(DATA_FOLDER / 'annotations.npy')
-        human_annotated = np.load(DATA_FOLDER / 'human_annotated.npy')
-        with open(DATA_FOLDER / 'calibration_frames.json', 'r') as f:
-            calibration_frames = json.load(f)
-        with open(DATA_FOLDER / 'best_individual.pkl', 'rb') as f:
-            best_individual = pickle.load(f)
-        best_fitness_so_far = fitness(best_individual, annotations)  # Recalculate fitness
-        reconstructed_3d_points = np.load(DATA_FOLDER / 'reconstructed_3d_points.npy')
-        with open(DATA_FOLDER / 'ground_plane.pkl', 'rb') as f:
-            ground_plane_data = pickle.load(f)
-        seed_mesh_poses[:] = np.load(DATA_FOLDER / 'seed_mesh_poses.npy')
-        with open(DATA_FOLDER / 'initial_seed_axis_info.pkl', 'rb') as f:
-            initial_seed_axis_info = pickle.load(f)
-        with open(DATA_FOLDER / 'reconstructed_seed_mesh.pkl', 'rb') as f:
-            reconstructed_seed_mesh = pickle.load(f)
-        print("State loaded successfully.")
-    except FileNotFoundError as e:
-        print(f"Error loading state: {e}")
-
-def import_sleap_predictions():
-    """Handles the import of SLEAP predictions from a .slp file."""
-    dpg.show_item("file_dialog_id")
-
-def sleap_file_callback(sender, app_data):
-    """Callback for the SLEAP file dialog."""
-    file_path = pathlib.Path(app_data['file_path_name'])
-    session_match = re.search(r'(session\d+)', file_path.name)
-    if not session_match:
-        dpg.set_value("status_message", "Error: No 'sessionN' string found in the filename.")
-        dpg.show_item("status_message")
-        return
-    session_str = session_match.group(1)
-    session_files = [f for f in file_path.parent.glob(f"*{session_str}*.slp")]
-    if not session_files:
-        dpg.set_value("status_message", f"Error: No other slp files found for {session_str}.")
-        dpg.show_item("status_message")
-        return
-        
-    all_labels = [sleap_io.load_slp(str(f)) for f in session_files]
-    all_keypoints = all_labels[0].skeleton.node_names
-    with dpg.window(label="Import keypoints", modal=True, show=True, tag="sleap_keypoint_selector", width=400, height=350) as sleap_window:
-        dpg.add_text("Select the keypoints to import:")
-        def select_all(sender, app_data, user_data):
-            for keypoint in all_keypoints:
-                dpg.set_value(f"kp_checkbox_{keypoint}", True)
-        def deselect_all(sender, app_data, user_data):
-            for keypoint in all_keypoints:
-                dpg.set_value(f"kp_checkbox_{keypoint}", False)
-        with dpg.group(horizontal=True):
-            dpg.add_button(label="Select all", callback=select_all)
-            dpg.add_button(label="Deselect all", callback=deselect_all)
-        for keypoint in all_keypoints:
-            dpg.add_checkbox(label=keypoint, tag=f"kp_checkbox_{keypoint}", default_value=True)
-
-        def on_import_sleap_confirm(sender, app_data):
-            selected_keypoints = [kp for kp in all_keypoints if dpg.get_value(f"kp_checkbox_{kp}")]
-            process_sleap_data(all_labels, selected_keypoints)
-            dpg.delete_item("sleap_keypoint_selector")
-        dpg.add_button(label="Import", callback=on_import_sleap_confirm)
-        viewport_width = dpg.get_viewport_width()
-        viewport_height = dpg.get_viewport_height()
-        window_width = dpg.get_item_width(sleap_window)
-        window_height = dpg.get_item_height(sleap_window)
-        dpg.set_item_pos(sleap_window, [int((viewport_width - window_width) * 0.5), int((viewport_height - window_height) * 0.5)])
-
-def process_sleap_data(all_labels: List[sleap_io.Labels], selected_keypoints: List[str]):
-    """Processes the loaded SLEAP data and populates the sleap_annotations array."""
-    global sleap_annotations
-    sleap_annotations.fill(np.nan)
-    for labels in all_labels:
-            for frame_idx, labeled_frame in enumerate(labels):
-                if frame_idx >= video_metadata['num_frames']:
-                    break
-                video_name = pathlib.Path(labeled_frame.video.filename).name
-                try:
-                    cam_idx = video_names.index(video_name)
-                except ValueError:
-                    continue # Video not found in the current project
-                for instance in labeled_frame:
-                    for node_name in selected_keypoints:
-                        if node_name in [node.name for node in labels.skeleton.nodes]:
-                            try:
-                                point = instance[node_name]
-                                x, y = point[0][0], point[0][1]
-                                if not np.isnan(x) and not np.isnan(y):
-                                    point_idx = POINT_NAMES.index(node_name)
-                                    sleap_annotations[frame_idx, cam_idx, point_idx] = (x, y)
-                            except (KeyError, ValueError):
-                                continue
-
-# --- DearPyGui UI ---
+# --- DPG UI ---
 
 def get_screen_dimensions():
     """Gets the screen dimensions using tkinter."""
@@ -1027,7 +701,6 @@ def on_key_press(sender, app_data):
     allowed_keys = {dpg.mvKey_Q, dpg.mvKey_S, dpg.mvKey_P} # In autosegment mode
     if (auto_segment_mode or ground_plane_mode) and app_data not in allowed_keys:
         return
-
     match app_data:
         case dpg.mvKey_Spacebar:
             toggle_pause(sender, app_data, None)
@@ -1062,7 +735,7 @@ def on_key_press(sender, app_data):
         case dpg.mvKey_Q:
             dpg.stop_dearpygui()
         case dpg.mvKey_R:
-            toggle_record()
+            toggle_record(sender, app_data, None)
         case dpg.mvKey_Z:
             global focus_selected_point
             focus_selected_point = not focus_selected_point
@@ -1108,12 +781,13 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
             dpg.add_menu_item(label="Find worst calibration", callback=find_worst_frame)
             dpg.add_menu_item(label="Find worst reprojection", callback=find_worst_reprojection)
             dpg.add_menu_item(label="Add calibration frame", callback=add_to_calib_frames)
-        with dpg.menu(label="Segmentation"):
+        with dpg.menu(label="Seed"):
             dpg.add_menu_item(label="Enable 2D auto-segmentation", callback=lambda: toggle_auto_segment_mode(), check=True, tag="auto_segment_checkbox")
-            dpg.add_menu_item(label="Reconstruct 3D mesh", callback=reconstruct_seed_mesh)
+            dpg.add_menu_item(label="Reconstruct 3D object mesh", callback=reconstruct_seed_mesh)
             dpg.add_menu_item(label="Clear segmentation points", callback=clear_seed_points)
-            dpg.add_menu_item(label="Lock 3D seed mesh to 2D seed annotations", callback=lock_mesh_to_annotations)
-            dpg.add_menu_item(label="Estimate seed pose in current frame", callback=estimate_seed_pose)
+            dpg.add_menu_item(label="Lock 3D obj mesh to 2D obj annotations", callback=lock_mesh_to_annotations)
+            # dpg.add_menu_item(label="Estimate obj pose in current frame", callback=estimate_mesh_pose)
+            dpg.add_menu_item(label="Estimate obj roll", callback=toggle_mesh_roll_estimation)
         with dpg.menu(label="Ground plane"):
             dpg.add_menu_item(label="Estimate ground plane", callback=toggle_ground_plane)
 
@@ -1221,16 +895,6 @@ def create_control_panel():
         dpg.add_spacer(width=125)
         dpg.add_loading_indicator(tag="loading_indicator", show=False, style=1, speed=0.5)
 
-def calculate_manual_annotation_counts():
-    """Calculates the number of manual annotations for each frame."""
-    return np.sum(~np.isnan(annotations[:, :, :, 0]), axis=(1, 2))
-
-def calculate_sleap_annotation_counts():
-    """Calculates the number of SLEAP annotations for each frame."""
-    if sleap_annotations is None:
-        return np.zeros(video_metadata['num_frames'])
-    return np.sum(~np.isnan(sleap_annotations[:, :, :, 0]), axis=(1, 2))
-
 def create_video_grid(scene_viz: SceneVisualizer):
     """Creates the grid for video feeds and 3D projection."""
     num_items = video_metadata['num_videos'] + 1
@@ -1255,15 +919,16 @@ def create_video_grid(scene_viz: SceneVisualizer):
                                 dpg.add_text("3D Projection")
                                 dpg.add_button(label="Reset view", small=True, callback=scene_viz.reset_view)
                                 dpg.add_button(label="Hide cameras", small=True, callback=toggle_cameras)
+                                dpg.add_button(label="Seed only", small=True, callback=toggle_show_seed_only)
                             dpg.add_image("3d_texture", tag="3d_image")
                             # Bind scene visualizer mouse events to the 3D image
                             with dpg.item_handler_registry(tag="3d_image_handler"):
                                 dpg.add_item_clicked_handler(callback=scene_viz.dpg_drag_start)
                             dpg.bind_item_handler_registry("3d_image", "3d_image_handler")
 
-# --- DearPyGui callbacks ---
+# --- DPG callbacks ---
 
-def toggle_record():
+def toggle_record(sender, app_data, user_data):
     global save_output_video, video_save_output
     save_output_video = not save_output_video
     if save_output_video:
@@ -1276,7 +941,6 @@ def toggle_record():
         video_save_output = cv2.VideoWriter("recording.mp4", fourcc, 30.0,
                                             (video_metadata['width'] * GRID_COLS,
                                              video_metadata['height'] * num_rows))
-    print(f"Recording toggled: {save_output_video}")
 
 def toggle_pause(sender, app_data, user_data):
     global paused
@@ -1358,17 +1022,23 @@ def toggle_ga_pause():
     global train_ga
     train_ga = not train_ga
 
+def reset_ga():
+    global generation, best_fitness_so_far, best_individual
+    generation = 0
+    best_fitness_so_far = float('inf')
+    best_individual = None
+
 def toggle_cameras():
     """Toggles the visibility of the cameras in the 3D view."""
     global show_cameras, needs_3d_reconstruction
     show_cameras = not show_cameras
     needs_3d_reconstruction = True  # Trigger a redraw of the scene
 
-def reset_ga():
-    global generation, best_fitness_so_far, best_individual
-    generation = 0
-    best_fitness_so_far = float('inf')
-    best_individual = None
+def toggle_show_seed_only():
+    """Toggles the visibility of the cameras in the 3D view."""
+    global show_seed_only, needs_3d_reconstruction
+    show_seed_only = not show_seed_only
+    needs_3d_reconstruction = True  # Trigger a redraw of the scene
 
 def add_to_calib_frames(sender, app_data, user_data):
     global calibration_frames
@@ -1402,7 +1072,7 @@ def image_click_callback(sender, app_data, user_data):
             try:
                 print(f"Running auto-segmentation for camera {cam_idx} with prompt at {mouse_pos}...")
                 frame_to_segment = current_frames[cam_idx] # Get current frame for segmentation
-                contour_points = get_sam_segmentation(frame_to_segment, mouse_pos)
+                contour_points = get_sam_segmentation(frame_to_segment, mouse_pos, sam_predictor)
                 if contour_points is not None:
                     seed_points_2d[cam_idx] = contour_points.tolist() # Replace the old points with new contour
                     # print(f"Successfully segmented seed with {len(contour_points)} points.")
@@ -1448,14 +1118,31 @@ def image_click_callback(sender, app_data, user_data):
         if show_manual_annotations:
             annotations[frame_idx, cam_idx, selected_point_idx] = (float(mouse_pos[0]), float(mouse_pos[1]))
             human_annotated[frame_idx, cam_idx, selected_point_idx] = True
-            print(f"Annotated {POINT_NAMES[selected_point_idx]} at ({mouse_pos[0]:.2f}, {mouse_pos[1]:.2f}) in Cam {cam_idx} at frame {frame_idx}")
+            print(f"Annotated {POINT_NAMES[selected_point_idx]} at ({mouse_pos[0]:.2f}, {mouse_pos[1]:.2f}) in cam {cam_idx} at frame {frame_idx}")
             needs_3d_reconstruction = True
     elif app_data[0] == 1: # Right click to remove annotation
         if show_manual_annotations:
             annotations[frame_idx, cam_idx, selected_point_idx] = np.nan
             human_annotated[frame_idx, cam_idx, selected_point_idx] = False
-            print(f"Removed annotation for {POINT_NAMES[selected_point_idx]} in Cam {cam_idx} at frame {frame_idx}")
+            print(f"Removed annotation for {POINT_NAMES[selected_point_idx]} in cam {cam_idx} at frame {frame_idx}")
             needs_3d_reconstruction = True
+
+def toggle_auto_segment_mode():
+    """Toggles the automatic seed segmentation mode."""
+    global auto_segment_mode
+    auto_segment_mode = not auto_segment_mode
+    if auto_segment_mode and sam_predictor is None:
+        initialise_sam_model() # Load the model when mode is first enabled
+        if sam_predictor is None:
+            auto_segment_mode = False
+            dpg.set_value("status_message", "Loading of SAM2 model failed. Please check its .pth file is in 'data'.")
+    dpg.set_value("auto_segment_checkbox", auto_segment_mode)
+    if auto_segment_mode:
+        dpg.set_value("status_message", "Left-click in a video frame to segment an object.")
+    else:
+        dpg.set_value("status_message", "")
+    dpg.show_item("status_message")
+    print(f"Auto-segment mode: {'On' if auto_segment_mode else 'Off'}")
 
 def clear_seed_points():
     """Clears all selected sam-segmented seed points."""
@@ -1552,71 +1239,106 @@ def reconstruct_seed_mesh():
 
 def lock_mesh_to_annotations():
     """Locks the 3D seed mesh to the annotated seed axis throughout the video."""
-    global needs_3d_reconstruction
+    global needs_3d_reconstruction, seed_mesh_poses
     if reconstructed_seed_mesh is None:
-        dpg.set_value("status_message", "Error: Reconstruct a mesh before locking it.")
+        dpg.set_value("status_message", "Error: Reconstruct a mesh before locking it to the axis labels of the object.")
         dpg.show_item("status_message")
         return
     if 's_small' not in POINT_NAMES or 's_large' not in POINT_NAMES:
         dpg.set_value("status_message", "Error: 's_small' and 's_large' must be defined in the SKELETON.")
         dpg.show_item("status_message")
         return
-
-    calculate_mesh_poses_from_axis()
+    seed_mesh_poses = calculate_mesh_poses_from_axis(POINT_NAMES, ('s_small', 's_large'), initial_seed_axis_info,  video_metadata['num_frames'], seed_mesh_poses, reconstructed_3d_points)
     needs_3d_reconstruction = True
 
-def calculate_mesh_poses_from_axis():
-    """Calculates the pose of the seed mesh for every frame, by its alignment with the
-    's_small' and 's_large' keypoints.
-    """
-    global seed_mesh_poses
-    if not initial_seed_axis_info:
-        print("Error: Initial seed axis information not available.")
+def import_sleap_predictions():
+    """Handles the import of SLEAP predictions from a .slp file."""
+    dpg.show_item("file_dialog_id")
+
+def sleap_file_callback(sender, app_data):
+    """Callback for the SLEAP file dialog."""
+    file_path = pathlib.Path(app_data['file_path_name'])
+    session_match = re.search(r'(session\d+)', file_path.name)
+    if not session_match:
+        dpg.set_value("status_message", "Error: No 'sessionN' string found in the filename.")
+        dpg.show_item("status_message")
         return
-    s_small_idx = POINT_NAMES.index('s_small')
-    s_large_idx = POINT_NAMES.index('s_large')
-    # Get initial axis information from the frame where the mesh was reconstructed
-    initial_frame_idx = initial_seed_axis_info['frame_idx']
-    initial_s_small_3d = initial_seed_axis_info['s_small_3d']
-    initial_s_large_3d = initial_seed_axis_info['s_large_3d']
-
-    if np.isnan(initial_s_small_3d).any() or np.isnan(initial_s_large_3d).any():
-        print("Error: The initial seed axis points were not annotated in the reconstruction frame.")
+    session_str = session_match.group(1)
+    session_files = [f for f in file_path.parent.glob(f"*{session_str}*.slp")]
+    if not session_files:
+        dpg.set_value("status_message", f"Error: No other slp files found for {session_str}.")
+        dpg.show_item("status_message")
         return
+        
+    all_labels = [sleap_io.load_slp(str(f)) for f in session_files]
+    all_keypoints = all_labels[0].skeleton.node_names
+    with dpg.window(label="Import keypoints", modal=True, show=True, tag="sleap_keypoint_selector", width=400, height=350) as sleap_window:
+        dpg.add_text("Select the keypoints to import:")
+        def select_all(sender, app_data, user_data):
+            for keypoint in all_keypoints:
+                dpg.set_value(f"kp_checkbox_{keypoint}", True)
+        def deselect_all(sender, app_data, user_data):
+            for keypoint in all_keypoints:
+                dpg.set_value(f"kp_checkbox_{keypoint}", False)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Select all", callback=select_all)
+            dpg.add_button(label="Deselect all", callback=deselect_all)
+        for keypoint in all_keypoints:
+            dpg.add_checkbox(label=keypoint, tag=f"kp_checkbox_{keypoint}", default_value=True)
 
-    # Change seed mesh pose according to rotation and translation changes of seed
-    initial_midpoint = (initial_s_small_3d + initial_s_large_3d) / 2
-    initial_axis_vec = initial_s_large_3d - initial_s_small_3d
-    initial_axis_vec_norm = initial_axis_vec / np.linalg.norm(initial_axis_vec)  # Norm axis vectors
-    for f in range(initial_frame_idx, video_metadata['num_frames']):
-        current_s_small_3d = reconstructed_3d_points[f, s_small_idx]
-        current_s_large_3d = reconstructed_3d_points[f, s_large_idx]
-        # If axis points are not available for the current frame, extrapolate from the previous frame
-        if np.isnan(current_s_small_3d).any() or np.isnan(current_s_large_3d).any():
-            if f > 0:
-                seed_mesh_poses[f] = seed_mesh_poses[f - 1] # Use pose from the previous frame
-            continue
-        current_midpoint = (current_s_small_3d + current_s_large_3d) / 2
-        current_axis_vec = current_s_large_3d - current_s_small_3d
-        current_axis_vec_norm = current_axis_vec / np.linalg.norm(current_axis_vec)
-        # Find the rotation that aligns the original axis vector with the current one
-        rotation, _ = Rotation.align_vectors(current_axis_vec_norm, initial_axis_vec_norm)
-        rotation_matrix = rotation.as_matrix()
-        rvec, _ = cv2.Rodrigues(rotation_matrix)
-        # Calculate the translation
-        tvec = current_midpoint - (rotation_matrix @ initial_midpoint)
-        seed_mesh_poses[f, :3] = tvec.flatten()
-        seed_mesh_poses[f, 3:] = rvec.flatten()
+        def on_import_sleap_confirm(sender, app_data):
+            selected_keypoints = [kp for kp in all_keypoints if dpg.get_value(f"kp_checkbox_{kp}")]
+            process_sleap_data(all_labels, selected_keypoints)
+            dpg.delete_item("sleap_keypoint_selector")
+        dpg.add_button(label="Import", callback=on_import_sleap_confirm)
+        viewport_width = dpg.get_viewport_width()
+        viewport_height = dpg.get_viewport_height()
+        window_width = dpg.get_item_width(sleap_window)
+        window_height = dpg.get_item_height(sleap_window)
+        dpg.set_item_pos(sleap_window, [int((viewport_width - window_width) * 0.5), int((viewport_height - window_height) * 0.5)])
 
-# --- Main loop (DPG) ---
+def process_sleap_data(all_labels: List[sleap_io.Labels], selected_keypoints: List[str]):
+    """Processes the loaded SLEAP data and populates the sleap_annotations array."""
+    global sleap_annotations
+    sleap_annotations.fill(np.nan)
+    for labels in all_labels:
+            for frame_idx, labeled_frame in enumerate(labels):
+                if frame_idx >= video_metadata['num_frames']:
+                    break
+                video_name = pathlib.Path(labeled_frame.video.filename).name
+                try:
+                    cam_idx = video_names.index(video_name)
+                except ValueError:
+                    continue # Video not found in the current project
+                for instance in labeled_frame:
+                    for node_name in selected_keypoints:
+                        if node_name in [node.name for node in labels.skeleton.nodes]:
+                            try:
+                                point = instance[node_name]
+                                x, y = point[0][0], point[0][1]
+                                if not np.isnan(x) and not np.isnan(y):
+                                    point_idx = POINT_NAMES.index(node_name)
+                                    sleap_annotations[frame_idx, cam_idx, point_idx] = (x, y)
+                            except (KeyError, ValueError):
+                                continue
 
-def calculate_annotation_counts():
-    """Calculates the number of annotations for each frame."""
-    return np.sum(~np.isnan(annotations[:, :, :, 0]), axis=(1, 2))
+def toggle_ground_plane():
+    """Toggles the ground plane estimation mode."""
+    global ground_plane_mode
+    ground_plane_mode = not ground_plane_mode
+    if ground_plane_mode:
+        dpg.set_value("status_message", "Select four points on the ground plane in at least two views (in the same order).")
+        dpg.show_item("status_message")
+        for i in range(video_metadata['num_videos']):
+            ground_plane_data['points_2d'][i].clear()  # Clear previous points
+    else:
+        dpg.hide_item("status_message")
 
-def calculate_keypoint_annotation_counts(point_idx):
-    """Calculates the number of annotations for a specific keypoint for each frame."""
-    return np.sum(~np.isnan(annotations[:, :, point_idx, 0]), axis=1)
+def calculate_sleap_annotation_counts():
+    """Calculates the number of SLEAP annotations for each frame."""
+    if sleap_annotations is None:
+        return np.zeros(video_metadata['num_frames'])
+    return np.sum(~np.isnan(sleap_annotations[:, :, :, 0]), axis=(1, 2))
 
 def on_histogram_click(sender, app_data):
     """Callback for when the annotation histogram is clicked."""
@@ -1648,61 +1370,49 @@ def toggle_sleap_annotations(sender, app_data, user_data):
     show_sleap_annotations = not show_sleap_annotations
     dpg.configure_item("sleap_histogram_series", show=app_data)
 
-def initialise_sam_model():
-    """Loads the SAM model into memory and prepares it for inference."""
-    global sam_predictor
-    if not SAM_MODEL_PATH.exists():
-        print(f"SAM model checkpoint not found at '{SAM_MODEL_PATH}'.")
-        print("Please download it and place it in the 'data' folder.")
-        return
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    try:
-        sam = sam_model_registry["vit_b"](checkpoint=str(SAM_MODEL_PATH))
-        sam.to(device=device)
-        sam_predictor = SamPredictor(sam)
-    except Exception as e:
-        print(f"Error loading SAM model: {e}")
-        sam_predictor = None
-
-def get_sam_segmentation(frame, point_prompt):
-    """Uses the SAM model to segment an object based on a single point prompt."""
-    if sam_predictor is None:
-        print("SAM model is not initialized.")
-        return None
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    sam_predictor.set_image(rgb_frame)
-    input_point = np.array([point_prompt])
-    input_label = np.array([1]) # 1 indicates a foreground point
-    masks, scores, logits = sam_predictor.predict(
-        point_coords=input_point,
-        point_labels=input_label,
-        multimask_output=False, # We want the single best mask
-    )
-    if masks is None or len(masks) == 0:
-        return None
-    mask = masks[0].astype(np.uint8) # Convert the boolean mask to contour points
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    largest_contour = max(contours, key=cv2.contourArea)
-    return largest_contour.squeeze(axis=1) # Shape: (N, 2)
-
-def toggle_auto_segment_mode():
-    """Toggles the automatic seed segmentation mode."""
-    global auto_segment_mode
-    auto_segment_mode = not auto_segment_mode
-    if auto_segment_mode and sam_predictor is None:
-        initialise_sam_model() # Load the model when mode is first enabled
-        if sam_predictor is None:
-            auto_segment_mode = False
-            dpg.set_value("status_message", "Loading of SAM2 model failed. Please check its .pth file is in 'data'.")
-    dpg.set_value("auto_segment_checkbox", auto_segment_mode)
-    if auto_segment_mode:
-        dpg.set_value("status_message", "Left-click in a video frame to segment an object.")
+def toggle_mesh_roll_estimation():
+    # Assumes that seed pose has first been locked to mesh axis labels
+    global mesh_roll_estimation_mode, mesh_roll_points_2d, needs_3d_reconstruction, intersection_points_3d, mesh_roll_tracks
+    mesh_roll_estimation_mode = not mesh_roll_estimation_mode
+    mesh_roll_tracks = None # Clear previous tracks
+    cam_idx = 3
+    # num_frames = 20
+    if mesh_roll_estimation_mode:
+        if best_individual is None:
+            dpg.set_value("status_message", "Error: Provide calibration before estimating mesh roll.")
+            dpg.show_item("status_message")
+            mesh_roll_estimation_mode = False
+            return
+        
+        num_frames_per_iter = 100 # Run loop for 50 frames before initialising points
+        start_frame = frame_idx
+        # for i in range(num_frames // num_frames_per_iter):
+        for i in range(1):
+            idx_small, idx_large = POINT_NAMES.index('s_small'), POINT_NAMES.index('s_large')
+            # frame = start_frame + (i * num_frames_per_iter)
+            frame = frame_idx
+            point_small_2d, point_large_2d = annotations[frame, cam_idx, idx_small], annotations[frame, cam_idx, idx_large]
+            if np.any(np.isnan(point_small_2d)) or np.any(np.isnan(point_large_2d)):
+                dpg.set_value("status_message", f"Error: Annotate 's_small' and 's_large' in camera {cam_idx} frame {frame} before estimating mesh roll.")
+                dpg.show_item("status_message")
+                mesh_roll_estimation_mode = False
+                return
+            mesh_roll_points_2d = scatter_pts_between(point_small_2d, point_large_2d, num_points=80)
+            intersection_points_3d, intersection_mask = get_intersections_with_mesh_surface(best_individual[cam_idx], mesh_roll_points_2d, reconstructed_seed_mesh, seed_mesh_poses[frame])
+            mesh_roll_points_2d = mesh_roll_points_2d[intersection_mask]
+            needs_3d_reconstruction = True
+            dpg.set_value("status_message", f"{len(intersection_points_3d)} intersection points found on mesh.")
+            dpg.show_item("status_message")
+            if len(intersection_points_3d) > 0:
+                run_mesh_roll_tracking(frame, np.array(mesh_roll_points_2d), cam_idx, num_frames=num_frames_per_iter)
+            else:
+                mesh_roll_points_2d = [] # Clear points if no intersections
     else:
-        dpg.set_value("status_message", "")
-    dpg.show_item("status_message")
-    print(f"Auto-segment mode: {'On' if auto_segment_mode else 'Off'}")
+        mesh_roll_points_2d = [] # Clear points when toggling off
+        intersection_points_3d = None
+        needs_3d_reconstruction = True
+
+# --- Main DPG loop ---
 
 def main_dpg():
     """Main loop for the DearPyGui application."""
@@ -1747,7 +1457,7 @@ def main_dpg():
             dpg.configure_item("histogram_y_axis", label=f"'{POINT_NAMES[selected_point_idx]}'")
             dpg.set_axis_limits("histogram_y_axis", 0, video_metadata['num_videos'])
         else:
-            manual_counts = calculate_manual_annotation_counts()
+            manual_counts = np.sum(~np.isnan(annotations[:, :, :, 0]), axis=(1, 2))
             sleap_counts = calculate_sleap_annotation_counts()
             dpg.configure_item("histogram_y_axis", label="Total Annotations")
             max_val = max(np.max(manual_counts) if len(manual_counts) > 0 else 0, 
@@ -1794,22 +1504,23 @@ def main_dpg():
             needs_3d_reconstruction = False
             update_3d_reconstruction(best_individual)
             scene.clear()
-            if show_cameras:
+            if show_cameras and show_seed_only is False:
                 for i, cam in enumerate(best_individual):
                     cam_viz = create_camera_visual(cam_params=cam, scale=1.0, color=point_colors[i % len(point_colors)], label=video_names[i])
                     scene.extend(cam_viz)
-            points_3d = reconstructed_3d_points[frame_idx]
-            for i, point in enumerate(points_3d):
-                if not np.isnan(point).any():
-                    scene.append(SceneObject(type='point', coords=point, color=point_colors[i % len(point_colors)], label=POINT_NAMES[i]))
-                from_name = POINT_NAMES[i]
-                for to in SKELETON[from_name]:
-                    to_id = POINT_NAMES.index(to)
-                    if not np.isnan(point).any() and not np.isnan(points_3d[to_id]).any():
-                        scene.append(SceneObject(type='line', coords=np.array([point, points_3d[to_id]]), color=point_colors[i % len(point_colors)], label=None))
+            if show_seed_only is False:
+                points_3d = reconstructed_3d_points[frame_idx]
+                for i, point in enumerate(points_3d):
+                    if not np.isnan(point).any():
+                        scene.append(SceneObject(type='point', coords=point, color=point_colors[i % len(point_colors)], label=POINT_NAMES[i]))
+                    from_name = POINT_NAMES[i]
+                    for to in SKELETON[from_name]:
+                        to_id = POINT_NAMES.index(to)
+                        if not np.isnan(point).any() and not np.isnan(points_3d[to_id]).any():
+                            scene.append(SceneObject(type='line', coords=np.array([point, points_3d[to_id]]), color=point_colors[i % len(point_colors)], label=None))
 
             if reconstructed_seed_mesh is not None and frame_idx >= initial_seed_axis_info.get('frame_idx', -1):
-                points_3d = translate_rotate_seed_mesh_3d(seed_mesh_poses[frame_idx]) # (N, 3)
+                points_3d = translate_rotate_mesh_3d(seed_mesh_poses[frame_idx], reconstructed_seed_mesh["points"]) # (N, 3)
                 faces = reconstructed_seed_mesh["faces"]
                 for face in faces:
                     p1 = points_3d[face[0]]
@@ -1819,7 +1530,26 @@ def main_dpg():
                     scene.append(SceneObject(type='line', coords=np.array([p2, p3]), color=(0, 255, 255), label=None))
                     scene.append(SceneObject(type='line', coords=np.array([p3, p1]), color=(0, 255, 255), label=None))
 
-            if ground_plane_data and ground_plane_data['plane_model']:
+            # # Draw the 3D intersection points for mesh roll estimation (predictions)
+            # if mesh_roll_estimation_mode and predictions_3d is not None and len(predictions_3d) > 0:
+            #     if frame_idx in predictions_3d.keys():
+            #         for point in predictions_3d[frame_idx]:
+            #             scene.append(SceneObject(type='point', coords=point, color=(0, 0, 255)))
+            #         for point in expected_3d_points[frame_idx]:
+            #             scene.append(SceneObject(type='point', coords=point, color=(0, 255, 255)))
+
+            # # Draw the 3D intersection points for mesh roll estimation (queries)
+            # if mesh_roll_estimation_mode and intersection_points_3d is not None and len(intersection_points_3d) > 0:
+            #     show = True
+            #     if mesh_roll_tracks is not None:
+            #         start_frame = mesh_roll_tracks['start_frame']
+            #         if (frame_idx - start_frame) >= 1:
+            #             show = False
+            #     if show:
+            #         for point in intersection_points_3d:
+            #             scene.append(SceneObject(type='point', coords=point, color=(0, 255, 0)))
+
+            if ground_plane_data and ground_plane_data['plane_model'] and show_seed_only is False:
                 draw_ground_plane(scene)
 
         # Update video textures

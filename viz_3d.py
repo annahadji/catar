@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from typing import TypedDict, List, Tuple, Optional
 import dearpygui.dearpygui as dpg
+from calibration import CameraParams
 
 
 class SceneObject(TypedDict):
@@ -80,7 +81,6 @@ class SceneVisualizer:
             dx, dy = dpg.get_mouse_drag_delta()
             self.azimuth -= dx * 0.0005
             self.elevation -= dy * 0.0005
-
 
     def dpg_on_mouse_wheel(self, sender, app_data, user_data):
         """Global callback for the mouse wheel."""
@@ -178,6 +178,77 @@ class SceneVisualizer:
                 coord_idx += 1
 
         return canvas
+    
+def create_camera_visual(
+    cam_params: CameraParams,
+    scale: float = 1.0,
+    color: Tuple[int, int, int] = (255, 255, 0),
+    label: Optional[str] = None
+    ) -> List[SceneObject]:
+        """
+        Generates a list of SceneObjects to represent a camera's pose as a pyramid.
+
+        The function computes the camera's world position from its extrinsic parameters
+        (which define the world-to-camera transformation) and then transforms a
+        canonical pyramid shape from the camera's local coordinates into world coordinates.
+
+        Args:
+            cam_params: The camera's parameters, containing rvec and tvec.
+            scale: The size of the rendered pyramid.
+            color: The color for the camera visualization.
+            label: An optional label displayed at the camera's center.
+
+        Returns:
+            A list of SceneObjects representing the camera.
+        """
+        # Extrinsic parameters (world-to-camera transformation)
+        rvec = cam_params['rvec'] # (3,)
+        tvec = cam_params['tvec'] # (3,)
+        # Get camera-to-world rotation matrix (inverse of world-to-camera)
+        R, _ = cv2.Rodrigues(rvec) # (3, 3)
+        # Define canonical camera pyramid in its local coordinate system
+        #  (apex at the origin, pointing down the +Z axis)
+        #  Note: OpenCV's camera convention is +Y down, +X right.
+        w = 0.5 * scale
+        h = 0.4 * scale
+        depth = 0.8 * scale
+
+        # Points in the camera's local coordinate system
+        pyramid_points_cam = np.array([
+            [0, 0, 0],       # p0: Apex (camera center)
+            [-w, -h, depth], # p1: Top-left corner of base
+            [w, -h, depth],  # p2: Top-right corner
+            [w, h, depth],   # p3: Bottom-right corner
+            [-w, h, depth],  # p4: Bottom-left corner
+        ]) # (5, 3) - points in camera local coordinates
+
+        # 4. Transform local camera points to world coordinates.
+        # The camera center in the world is C = -R' * t
+        # A point in the world is p_w = C + R' * p_c = R' * (p_c - t)
+        cam_center_world = -R.T @ tvec # (3,)
+        pyramid_points_world = (pyramid_points_cam - tvec) @ R # (5, 3)
+        p0_w, p1_w, p2_w, p3_w, p4_w = pyramid_points_world
+        scene_objects: List[SceneObject] = []
+
+        # Camera center
+        scene_objects.append(SceneObject(type='point', coords=cam_center_world, color=color, label=label))
+
+        # Pyramid edges (from apex to base corners)
+        scene_objects.append(SceneObject(type='line', coords=np.array([p0_w, p1_w]), color=color, label=None))
+        scene_objects.append(SceneObject(type='line', coords=np.array([p0_w, p2_w]), color=color, label=None))
+        scene_objects.append(SceneObject(type='line', coords=np.array([p0_w, p3_w]), color=color, label=None))
+        scene_objects.append(SceneObject(type='line', coords=np.array([p0_w, p4_w]), color=color, label=None))
+
+        # Pyramid base
+        scene_objects.append(SceneObject(type='line', coords=np.array([p1_w, p2_w]), color=color, label=None))
+        scene_objects.append(SceneObject(type='line', coords=np.array([p2_w, p3_w]), color=color, label=None))
+        scene_objects.append(SceneObject(type='line', coords=np.array([p3_w, p4_w]), color=color, label=None))
+        scene_objects.append(SceneObject(type='line', coords=np.array([p4_w, p1_w]), color=color, label=None))
+
+        # Add a line to indicate the 'up' direction (+Y is down in camera coords)
+        up_color = (255, 255, 255) # White for the 'up' vector
+        scene_objects.append(SceneObject(type='line', coords=np.array([p1_w, p2_w]), color=up_color, label=None))
+        return scene_objects
 
 def create_demo_scene() -> List[SceneObject]:
     """Generates a list of objects for demonstration."""
