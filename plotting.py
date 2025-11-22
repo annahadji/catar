@@ -290,12 +290,13 @@ def plot_ant_seed_interaction(
         name: POINT_NAMES.index(point_name)
         for name, point_name in [
             ("mand_L", "m_L1"), ("mand_R", "m_R1"),
-            ("ant_L", "a_L2"), ("ant_R", "a_R2")
+            ("ant_L", "a_L2"), ("ant_R", "a_R2"),
+            ("leg_L", "leg_f_L2"), ("leg_R", "leg_f_R2"),
         ]
     }
-    positions = { "mand_L": [], "mand_R": [], "ant_L": [], "ant_R": [] }
-    frames = { "mand_L": [], "mand_R": [], "ant_L": [], "ant_R": [] }
-    contacts = { "mand_L": {}, "mand_R": {}, "ant_L": {}, "ant_R": {} }
+    positions = { "mand_L": [], "mand_R": [], "ant_L": [], "ant_R": [], "leg_L": [], "leg_R": [] }
+    frames = { "mand_L": [], "mand_R": [], "ant_L": [], "ant_R": [], "leg_L": [], "leg_R": []  }
+    contacts = { "mand_L": {}, "mand_R": {}, "ant_L": {}, "ant_R": {}, "leg_L": {}, "leg_R": {}  }
     base_seed_vertices, base_seed_faces = reconstructed_seed_mesh['points'], reconstructed_seed_mesh['faces']
     for i in range(start_idx, end_idx):
         pose = seed_mesh_poses[i]
@@ -306,7 +307,7 @@ def plot_ant_seed_interaction(
         R_aligned_inv = R_aligned.T
         posed_seed_vertices_aligned = (R_aligned @ base_seed_vertices.T).T + T_aligned
         seed_mesh_trimesh = trimesh.Trimesh(vertices=posed_seed_vertices_aligned, faces=base_seed_faces)
-        for part in ["mand_L", "mand_R", "ant_L", "ant_R"]:
+        for part in ["mand_L", "mand_R", "ant_L", "ant_R", "leg_L", "leg_R"]:
             keypoint_aligned = points_3d_aligned[i, indices[part], :]
             if np.isnan(keypoint_aligned).any():
                 continue
@@ -341,7 +342,9 @@ def plot_ant_seed_interaction(
         'mand_L': {'pos_color': 'Greens', 'cont_color': 'springgreen', 'name': 'Left mandible', 'line_color': 'green'},
         'mand_R': {'pos_color': 'Purples', 'cont_color': 'magenta', 'name': 'Right mandible', 'line_color': 'purple'},
         'ant_L': {'pos_color': 'Blues', 'cont_color': 'deepskyblue', 'name': 'Left antenna', 'line_color': 'blue'},
-        'ant_R': {'pos_color': 'Reds', 'cont_color': 'red', 'name': 'Right antenna', 'line_color': 'darkred'}
+        'ant_R': {'pos_color': 'Reds', 'cont_color': 'red', 'name': 'Right antenna', 'line_color': 'darkred'},
+        'leg_L': {'pos_color': 'Reds', 'cont_color': '#ff7f0e', 'name': 'Left leg', 'line_color': 'orange'},
+        'leg_R': {'pos_color': 'Purples', 'cont_color': '#e377c2', 'name': 'Right leg', 'line_color': 'pink'}        
     }
     hover_template = (
         '<b>Frame</b>: %{customdata}<br>' +
@@ -416,6 +419,6 @@ if __name__ == "__main__":
         seed_mesh_poses,
         rotation_obj,
         origin_on_plane,
-        contact_threshold=0.2,
-        frame_range=(400, 1000),
-    )    
+        contact_threshold=0.1,
+        frame_range=(450, 1050)
+    )
