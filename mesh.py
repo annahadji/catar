@@ -4,7 +4,8 @@ import cv2
 from scipy.spatial import ConvexHull
 from scipy.spatial.transform import Rotation
 import trimesh
-from scipy.optimize import minimize, minimize_scalar
+from scipy.optimize import minimize_scalar
+from typing import Tuple
 
 from calibration import reproject_points, undistort_points
 
@@ -203,40 +204,29 @@ def calculate_change_between_poses(pose1: np.ndarray, pose2: np.ndarray):
     rvec_change_flat = rvec_change.flatten()    
     return np.hstack((rvec_change_flat, tvec_change_flat))
 
+
 def find_optimal_roll(
     source_points: np.ndarray,
     target_points: np.ndarray,
     axis_vector_norm: np.ndarray,
     axis_center: np.ndarray
-) -> tuple[float, float]:
-    """Find the optimal roll angle to align source_points with target_points."""
-    assert source_points.shape == target_points.shape, "Number of source and target points dont match"
-
+) -> Tuple[float, float]:
+    """
+    Finds optimal roll required to match source points to target points,
+    around a vector axis.
+    """
     def objective_func(theta: float) -> float:
-        # Create the rotation object for this 'theta'
-        # R.from_rotvec creates a rotation from a vector where
-        # the direction is the axis and the magnitude is the angle.
         rotation = Rotation.from_rotvec(theta * axis_vector_norm)
-        # Apply the rotation.
         source_translated = source_points - axis_center
         source_rotated = rotation.apply(source_translated)
         source_rolled = source_rotated + axis_center
-        return np.sum((source_rolled - target_points)**2)  # Sum of squared distances error
-
-    # Find the 'theta' that minimises discrepency between source and target pts
+        return np.sum((source_rolled - target_points)**2)
     result = minimize_scalar(
         objective_func,
-        bounds=(-np.pi, np.pi),  # Roll is periodic
+        bounds=(-np.pi, np.pi),
         method='bounded'
     )
-
-    if not result.success:
-        print(f"Warning: Optimization may not have succeeded: {result.message}")
-
-    optimal_angle_radians = result.x
-    min_error = result.fun
-    return optimal_angle_radians, min_error
-
+    return result.x, result.fun
 
 # def estimate_mesh_pose():
 #     """Estimates the seed mesh pose for the current frame using PnP."""

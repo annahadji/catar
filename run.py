@@ -14,7 +14,7 @@ import json
 import itertools
 import re
 from tqdm import tqdm
-from typing import List, Tuple, Optional
+from typing import List
 from viz_3d import SceneObject, SceneVisualizer, create_camera_visual
 import dearpygui.dearpygui as dpg
 import tkinter as tk
@@ -23,10 +23,8 @@ from scipy.spatial.transform import Rotation
 from segment_anything import sam_model_registry, SamPredictor
 import torch
 import sleap_io
-import trimesh
-import os  # Added for CoTracker
-import torch.nn.functional as F  # Added for CoTracker
-from cotracker.predictor import CoTrackerPredictor  # Added for CoTracker
+import torch.nn.functional as F
+from cotracker.predictor import CoTrackerPredictor
 
 from calibration import (
     CameraParams,
@@ -51,7 +49,6 @@ from mesh import (
     scatter_pts_between,
     get_intersections_with_mesh_surface,
     calculate_change_between_poses,
-    pose_vec_to_matrix,
     find_optimal_roll
 )
 
@@ -96,7 +93,7 @@ GROUND_PLANE_POINTS = [
 GROUND_PLANE_INDICES = np.array([list(SKELETON.keys()).index(p) for p in GROUND_PLANE_POINTS if p in SKELETON.keys()]) # (len(GROUND_PLANE_POINTS),)
 POINT_NAMES = list(SKELETON.keys())
 NUM_POINTS = len(POINT_NAMES)
-GRID_COLS = 3  # Fixed number of columns to display the videos etc. for now
+GRID_COLS = 3  # Num of columns to display videos
 
 # Genetic algorithm parameters
 POPULATION_SIZE = 200
@@ -153,22 +150,21 @@ initial_seed_axis_info = {}  # Stores the axis info of the seed mesh when initia
 cotracker_model = None
 COTRACKER_CHECKPOINT_PATH = DATA_FOLDER / "scaled_offline.pth"
 COTRACKER_SCALE_FACTOR = 0.3
+COT_STEP_SIZE = 30
 
 # Seed roll estimation state
 mesh_roll_estimation_mode = False
-mesh_roll_points_2d = []  # 2d randomly sampled points to track on seed
-mesh_roll_tracks = None  # Stores results from CoTracker
+mesh_roll_data = {}  # i.e. { cam_idx: { 'start_pts_2d': np.array, 'start_pts_3d': np.array, 'tracks': np.array, 'visibility': np.array } }
 mesh_rolls: np.ndarray = None
-intersection_points_3d = None
-predictions_3d = {}
-expected_3d_points = {}
+predictions_3d = {}  # For visualisation
+expected_3d_points = {}  # For visualisation
 
 # Ground plane state
 ground_plane_mode = False
 ground_plane_data = None
 
 # UI and Control State
-frame_idx = 428 #300
+frame_idx = 750 #428 #300
 paused = True
 selected_point_idx = 0  # Default to P1
 focus_selected_point = False  # Whether to focus on the selected point in the visualisation
@@ -318,7 +314,7 @@ def initialise_sam_model():
         sam_predictor = None
 
 def initialise_cotracker_model():
-    """Loads the CoTracker model into memory."""
+    """Loads the cotracker model into memory."""
     global cotracker_model
     if not COTRACKER_CHECKPOINT_PATH.exists():
         dpg.set_value("status_message", f"Error: cotracker checkpoint not found at {COTRACKER_CHECKPOINT_PATH}.")
@@ -328,9 +324,8 @@ def initialise_cotracker_model():
         cotracker_model = CoTrackerPredictor(checkpoint=COTRACKER_CHECKPOINT_PATH)
         if torch.cuda.is_available():
             cotracker_model = cotracker_model.cuda()
-        print("CoTracker model loaded successfully.")
     except Exception as e:
-        print(f"Error loading CoTracker model: {e}")
+        print(f"Error loading cotracker model: {e}")
         cotracker_model = None
         dpg.set_value("status_message", f"Error loading CoTracker model: {e}")
         dpg.show_item("status_message")
@@ -363,112 +358,133 @@ def track_points(prev_gray, current_gray, cam_idx):
             if np.isnan(annotations[frame_idx, cam_idx, idx]).any() or not human_annotated[frame_idx, cam_idx, idx]:
                 annotations[frame_idx, cam_idx, idx] = good_new[i]
 
-def run_mesh_roll_tracking(start_frame: int, points_2d: np.ndarray, cam_idx: int, num_frames: int = 50):
-    """Tracks 2D points over a video clip using CoTracker."""
-    global cotracker_model, mesh_roll_tracks, video_captures, video_metadata, mesh_rolls, seed_mesh_poses, intersection_points_3d, best_individual, predictions_3d
+def run_mesh_roll_tracking(start_frame: int, num_frames: int = 300, frames_step: int = 50):
+    """Run cotracker for each camera in mesh roll data and solve for a single optimal
+    roll of 3d mesh per frame."""
+    global cotracker_model, mesh_roll_data, video_captures, video_metadata, seed_mesh_poses
+    global best_individual, predictions_3d, expected_3d_points
     if cotracker_model is None:
         initialise_cotracker_model()
-        if cotracker_model is None:
-            return
-    dpg.set_value("status_message", f"Running CoTracker for {num_frames} frames.")
+        if cotracker_model is None: return
+    dpg.set_value("status_message", f"Tracking across {len(mesh_roll_data)} cameras...")
     dpg.show_item("status_message")
     dpg.show_item("loading_indicator")
-    end_frame = min(start_frame + num_frames, video_metadata['num_frames'])
-    num_frames_to_track = end_frame - start_frame
-    if num_frames_to_track <= 0:
-        dpg.set_value("status_message", "Error: No frames to track.")
-        dpg.show_item("status_message")
-        dpg.hide_item("loading_indicator")
-        return
 
-    frames_to_track = []
-    cap = video_captures[cam_idx]
-    original_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    for f in range(num_frames_to_track):  # Extract appropriate frames
-        ret, frame = cap.read()
-        if not ret:
-            print(f"Warning: Could not read frame {start_frame + f}. Moving onto trackking.")
-            break
-        frames_to_track.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, original_pos)  # Restore original video pos
-    
-    # Update num_frames_to_track in case read failed early
-    num_frames_to_track = len(frames_to_track)
-    if num_frames_to_track == 0:
-        dpg.set_value("status_message", "Error: Could not read any frames for tracking.")
-        dpg.show_item("status_message")
-        dpg.hide_item("loading_indicator")
-        return
+    # Run cotracker for each camera view
+    for cam_idx, data in mesh_roll_data.items():
+        cap = video_captures[cam_idx]
+        original_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+        p_tracks, p_vis = [], []
+        for i, s_frame in enumerate(data["start_frame"]):
+            if len(data['start_pts_2d']) <= i:
+                continue
+            points_2d = data['start_pts_2d'][i]
+            # Prepare frames
+            cap.set(cv2.CAP_PROP_POS_FRAMES, s_frame)
+            frames_to_track = []
+            for _ in range(frames_step):
+                ret, frame = cap.read()
+                if not ret: break
+                frames_to_track.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            if not frames_to_track: continue
+            # Prepare and downsample video frames
+            video_tensor = torch.from_numpy(np.stack(frames_to_track)).permute(0, 3, 1, 2)[None].float()
+            B, T, C, H, W = video_tensor.shape
+            video_tensor_reshaped = video_tensor.view(B * T, C, H, W)
+            video_downsampled = F.interpolate(video_tensor_reshaped, scale_factor=COTRACKER_SCALE_FACTOR, mode='bilinear', align_corners=False)
+            _, C_new, H_new, W_new = video_downsampled.shape
+            video_downsampled = video_downsampled.view(B, T, C_new, H_new, W_new)
+            print(f"Video downsampled from {video_tensor.shape} to {video_downsampled.shape}")
+            scaled_points_np = (np.array(points_2d) + 0.5) * COTRACKER_SCALE_FACTOR - 0.5
+            queries = torch.tensor([[0, p[0], p[1]] for p in scaled_points_np]).float()[None]
+            if torch.cuda.is_available():
+                video_downsampled = video_downsampled.cuda()
+                queries = queries.cuda()
+            # Inference
+            with torch.no_grad():
+                pred_tracks, pred_vis = cotracker_model(video_downsampled, queries=queries, backward_tracking=True)
+            # Upscale results and store
+            pred_tracks = pred_tracks.squeeze(0).cpu().numpy() # (T, N, 2)
+            p_tracks.append((pred_tracks + 0.5) / COTRACKER_SCALE_FACTOR - 0.5)
+            p_vis.append(pred_vis.squeeze(0).cpu().numpy())  # (T, N)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, original_pos) # Reset video to original pos
+        mesh_roll_data[cam_idx]['tracks'] = p_tracks #np.concatenate(p_tracks, axis=1)
+        mesh_roll_data[cam_idx]['visibility'] = p_vis #np.concatenate(p_vis, axis=1)
+        print(f"> Camera {cam_idx} tracking complete.")
 
-    # Downsample video frames
-    video_tensor = torch.from_numpy(np.stack(frames_to_track)).permute(0, 3, 1, 2)[None].float() # (1, T, C, H, W)
-    B, T, C, H, W = video_tensor.shape
-    video_tensor_reshaped = video_tensor.view(B * T, C, H, W)
-    video_tensor_downsampled = F.interpolate(video_tensor_reshaped, scale_factor=COTRACKER_SCALE_FACTOR, mode='bilinear', align_corners=False)
-    _, C_new, H_new, W_new = video_tensor_downsampled.shape
-    video_tensor_downsampled = video_tensor_downsampled.view(B, T, C_new, H_new, W_new)
-    print(f"Downsampled video from {video_tensor.shape} to {video_tensor_downsampled.shape}")
-    
-    # Create 3D scaled queries for model from 2D points    
-    scaled_points_np = (np.array(points_2d) + 0.5) * COTRACKER_SCALE_FACTOR - 0.5
-    queries_list = [[0, p[0], p[1]] for p in scaled_points_np]
-    queries = torch.tensor(queries_list).float()[None] # (1, N, 3)
-    if torch.cuda.is_available():
-        video_tensor_downsampled = video_tensor_downsampled.cuda()
-        queries = queries.cuda()
+    # Multiview optimisation
+    print("Optimising 3D roll across camera views...")
+    for t in range(num_frames):
+        f = start_frame + t
+        if f >= video_metadata['num_frames']: break
+        all_expected_points, all_predicted_points = [], []
+        # Aggregate constraints from ALL cameras
+        for cam_idx, data in mesh_roll_data.items():
+            if 'tracks' not in data: continue
+            chunk_idx = np.where(np.array(data["start_frame"]) <= f)[0].max()
+            start_pts_3d = data['start_pts_3d'][chunk_idx]  # Start points for this 'chunk'
+            frame_in_chunk = f - data["start_frame"][chunk_idx]
+            current_pts_2d_raw = data['tracks'][chunk_idx][frame_in_chunk]
+            visibility_raw = data['visibility'][chunk_idx][frame_in_chunk] # (N,)
+            # Filter by cotracker visibility
+            vis_mask = visibility_raw > 0.8  # Cotracker is confident
+            if np.sum(vis_mask) < 3: 
+                continue # Skip camera if too few visible points
+            # Apply visibility mask to inputs
+            visible_pts_2d = current_pts_2d_raw[vis_mask]
+            visible_start_pts_3d = start_pts_3d[vis_mask]
+            # Raycast only the visible points to get 3D coordinates
+            # 'predicted_pts_cam' are the 3D coordinates on the mesh surface.
+            # 'intersect_mask' tells us if the ray actually hit the seed (or missed/fell off edge).
+            predicted_pts_cam, intersect_mask = get_intersections_with_mesh_surface(
+                best_individual[cam_idx], 
+                visible_pts_2d, 
+                reconstructed_seed_mesh, 
+                seed_mesh_poses[f]
+            )
+            # Keep only points that hit mesh
+            final_predicted_3d = predicted_pts_cam
+            change_pose = calculate_change_between_poses(seed_mesh_poses[data["start_frame"][chunk_idx]-1], seed_mesh_poses[f])
+            expected_pts_rotated = translate_rotate_mesh_3d(change_pose, visible_start_pts_3d)
+            final_expected_3d = expected_pts_rotated[intersect_mask]
+            if len(final_predicted_3d) > 0:
+                all_expected_points.append(final_expected_3d)
+                all_predicted_points.append(final_predicted_3d)
 
-    try:
-        with torch.no_grad():
-            pred_tracks, pred_visibility = cotracker_model(video_tensor_downsampled, queries=queries, backward_tracking=True)  # (1, T, N, 2), (1, T, N)
-        # Upscale tracks
-        pred_tracks = pred_tracks.squeeze(0).cpu().numpy() # (T, N, 2)
-        pred_visibility = pred_visibility.squeeze(0).cpu().numpy() # (T, N)
-        pred_tracks_upscaled = (pred_tracks + 0.5) / COTRACKER_SCALE_FACTOR - 0.5
-        mesh_roll_tracks = {
-            'start_frame': start_frame,
-            'cam_idx': cam_idx,
-            'tracks': pred_tracks_upscaled, # (T, N, 2)
-            'visibility': pred_visibility # (T, N)
-        }
-        print("Tracking complete.")
-        dpg.set_value("status_message", f"Seed points tracking complete. Found {len(points_2d)} tracks.")
-        dpg.show_item("status_message")
-
-        start_pose = seed_mesh_poses[start_frame]  # Pose of seed relative to its pose when it was first reconstructed
-        for t in range(1, num_frames_to_track):
-            f = start_frame + t
-            if f >= video_metadata['num_frames']:
-                break
-            change_pose = calculate_change_between_poses(start_pose, seed_mesh_poses[f])
-            expected_3d_points[f] = translate_rotate_mesh_3d(change_pose, intersection_points_3d)
-            points_2d_predictions = mesh_roll_tracks['tracks'][t]  # TODO: consider filtering these for which are visible?
-            predictions_3d[f], intersection_mask = get_intersections_with_mesh_surface(best_individual[cam_idx], points_2d_predictions, reconstructed_seed_mesh, seed_mesh_poses[f])
-            expected_3d_points[f] = expected_3d_points[f][intersection_mask]
-            # Estimate the optimal roll angle of the seed that minimises the discrepency between the query and tracked points
+        # Solve optimisation if we have data
+        if all_expected_points:
+            # Stack all points from all cameras into giant arrays
+            total_expected, total_predicted = np.vstack(all_expected_points), np.vstack(all_predicted_points)
+            # Store for visualisation
+            expected_3d_points[f], predictions_3d[f] = total_expected, total_predicted
+            # Calculate roll axis
             s_small_3d = reconstructed_3d_points[f, POINT_NAMES.index('s_small')]
             s_large_3d = reconstructed_3d_points[f, POINT_NAMES.index('s_large')]
-            axis_centre = (s_small_3d + s_large_3d) / 2 # To rotate around
+            axis_centre = (s_small_3d + s_large_3d) / 2
             axis_vec = s_large_3d - s_small_3d
-            axis_vec_norm = axis_vec / np.linalg.norm(axis_vec)  # Roll axis
-            roll_angle, min_err = find_optimal_roll(expected_3d_points[f], predictions_3d[f], axis_vec_norm, axis_centre)
-            print("Frame", f, "Estimated roll:", np.round(np.degrees(roll_angle),2), "Err:", np.round(min_err,2))
-            # Update seed pose with roll
+            axis_vec_norm = axis_vec / np.linalg.norm(axis_vec)
+            # Optimise using all points
+            roll_angle, min_err = find_optimal_roll(
+                total_expected, 
+                total_predicted, 
+                axis_vec_norm, 
+                axis_centre
+            )
+            print(f"Frame {f}: Roll {np.degrees(roll_angle):.2f}° (Err: {min_err:.2f}, N={len(total_expected)})")
+            # Apply roll to pose
             pose_vec_base = seed_mesh_poses[f]
             tvec_base, rvec_base = pose_vec_base[:3], pose_vec_base[3:]
             R_base, _ = cv2.Rodrigues(rvec_base)
             roll_rotation = Rotation.from_rotvec(roll_angle * axis_vec_norm)
-            R_roll = roll_rotation.as_matrix() # 3x3
+            R_roll = roll_rotation.as_matrix()
             R_new = R_roll @ R_base
             rvec_new, _ = cv2.Rodrigues(R_new)
             tvec_new = R_roll @ (tvec_base - axis_centre) + axis_centre
             seed_mesh_poses[f] = np.hstack((tvec_new.flatten(), rvec_new.flatten()))
-    except Exception as e:
-        print(f"Error during CoTracker inference or roll estimation: {e}")
-        dpg.set_value("status_message", f"Error during tracking: {e}")
-        dpg.show_item("status_message")
-    finally:
-        dpg.hide_item("loading_indicator")
+
+    dpg.set_value("status_message", "Roll optimisation complete.")
+    dpg.show_item("status_message")
+    dpg.hide_item("loading_indicator")
 
 # --- Camera calibration ---
 
@@ -622,30 +638,29 @@ def draw_ui(frame, cam_idx):
         for point in ground_plane_data['points_2d'][cam_idx]:
             cv2.circle(frame, tuple(np.array(point, dtype=int)), 5, (0, 255, 0), -1)
 
-    # Draw current points for mesh roll estimation
-    if mesh_roll_estimation_mode and cam_idx == 3:
-        show = True
-        if mesh_roll_tracks is not None:
-            start_frame = mesh_roll_tracks['start_frame']
-            if (frame_idx - start_frame) >= 1:
-                show = False
-        if show:
-            for point in mesh_roll_points_2d:
-                cv2.circle(frame, tuple(np.array(point, dtype=int)), 5, (0, 255, 0), -1)   
+    # Draw current points (initial scatter around seed axis)
+    if mesh_roll_estimation_mode and cam_idx in mesh_roll_data:
+        start_frames = mesh_roll_data[cam_idx].get("start_frame", [-1])
+        if frame_idx in start_frames:
+            idx = start_frames.index(frame_idx)
+            start_pts = mesh_roll_data[cam_idx].get('start_pts_2d', [])
+            if len(start_pts) > 0:
+                for point in start_pts[idx]:
+                    cv2.circle(frame, tuple(np.array(point, dtype=int)), 5, (0, 255, 0), -1)
 
-    # Draw cotracker points
-    if mesh_roll_tracks is not None and cam_idx == mesh_roll_tracks['cam_idx']:
-        start_frame = mesh_roll_tracks['start_frame']
-        num_tracked_frames = mesh_roll_tracks['tracks'].shape[0] # T
-        if start_frame <= frame_idx < start_frame + num_tracked_frames:
-            track_frame_idx = frame_idx - start_frame
-            tracks_at_frame = mesh_roll_tracks['tracks'][track_frame_idx, :, :] # (N, 2)
-            visibility_at_frame = mesh_roll_tracks['visibility'][track_frame_idx, :] # (N,)
-            # Cotracker recommend > 0.8 for "good" points
-            visibility_threshold = 0.8 
+    # Draw cotracker points (red) on camera views
+    if cam_idx in mesh_roll_data and 'tracks' in mesh_roll_data[cam_idx]:
+        data = mesh_roll_data[cam_idx]
+        if frame_idx > data["start_frame"][0] and frame_idx < (data["start_frame"][-1] + COT_STEP_SIZE):
+            chunk_idx = np.where(np.array(data["start_frame"]) <= frame_idx)[0].max()
+            start_frame = data["start_frame"][chunk_idx]
+            tracks = data["tracks"][chunk_idx] # (T, N, 2)
+            vis = data["visibility"][chunk_idx]
+            frame_in_chunk = frame_idx - start_frame
+            tracks_at_frame = tracks[frame_in_chunk]
+            vis_at_frame = vis[frame_in_chunk]
             for i, point_xy in enumerate(tracks_at_frame):
-                if visibility_at_frame[i] > visibility_threshold: # Check visibility
-                    # Draw tracked points in red
+                if vis_at_frame[i] > 0.8:  # TODO:
                     cv2.circle(frame, tuple(np.array(point_xy, dtype=int)), 3, (0, 0, 255), -1)
     return frame
 
@@ -865,7 +880,7 @@ def create_control_panel():
     dpg.add_text(f"Tracking: {'Enabled' if (keypoint_tracking_enabled or seed_pose_tracking_enabled) else 'Disabled'}", tag="tracking_text")
     dpg.add_text(f"Focus mode: {'Enabled' if focus_selected_point else 'Disabled'}", tag="focus_text")
     dpg.add_text(f"Annotating keypoint: {POINT_NAMES[selected_point_idx]}", tag="annotating_point_text")
-    dpg.add_spacing(count=5)
+    dpg.add_spacer()
     dpg.add_text(f"Best fitness: {best_fitness_so_far:.2f}", tag="fitness_text")
     dpg.add_text(f"Num annotation: {np.sum(~np.isnan(annotations[frame_idx])) // 2} / {NUM_POINTS * len(video_names)}", tag="num_annotations_text")
     dpg.add_text(f"Num 3D points: {np.sum(~np.isnan(reconstructed_3d_points[frame_idx]).any(axis=1))} / {NUM_POINTS}", tag="num_3d_points_text")
@@ -1371,45 +1386,77 @@ def toggle_sleap_annotations(sender, app_data, user_data):
     dpg.configure_item("sleap_histogram_series", show=app_data)
 
 def toggle_mesh_roll_estimation():
+    """
+    Toggles the mode. If turning ON, it scatters points on the seed in 
+    EVERY camera view where the seed axis is annotated, finds their 3D 
+    surface coordinates, and prepares for tracking.
+    """
     # Assumes that seed pose has first been locked to mesh axis labels
-    global mesh_roll_estimation_mode, mesh_roll_points_2d, needs_3d_reconstruction, intersection_points_3d, mesh_roll_tracks
+    global mesh_roll_estimation_mode, mesh_roll_data, needs_3d_reconstruction
+    global predictions_3d, expected_3d_points
+    
     mesh_roll_estimation_mode = not mesh_roll_estimation_mode
-    mesh_roll_tracks = None # Clear previous tracks
-    cam_idx = 3
-    # num_frames = 20
+    mesh_roll_data = {} # Clear previous data (TODO)
+    predictions_3d = {}
+    expected_3d_points = {}
     if mesh_roll_estimation_mode:
         if best_individual is None:
             dpg.set_value("status_message", "Error: Provide calibration before estimating mesh roll.")
             dpg.show_item("status_message")
             mesh_roll_estimation_mode = False
             return
-        
-        num_frames_per_iter = 100 # Run loop for 50 frames before initialising points
-        start_frame = frame_idx
-        # for i in range(num_frames // num_frames_per_iter):
-        for i in range(1):
-            idx_small, idx_large = POINT_NAMES.index('s_small'), POINT_NAMES.index('s_large')
-            # frame = start_frame + (i * num_frames_per_iter)
-            frame = frame_idx
-            point_small_2d, point_large_2d = annotations[frame, cam_idx, idx_small], annotations[frame, cam_idx, idx_large]
-            if np.any(np.isnan(point_small_2d)) or np.any(np.isnan(point_large_2d)):
-                dpg.set_value("status_message", f"Error: Annotate 's_small' and 's_large' in camera {cam_idx} frame {frame} before estimating mesh roll.")
-                dpg.show_item("status_message")
-                mesh_roll_estimation_mode = False
-                return
-            mesh_roll_points_2d = scatter_pts_between(point_small_2d, point_large_2d, num_points=80)
-            intersection_points_3d, intersection_mask = get_intersections_with_mesh_surface(best_individual[cam_idx], mesh_roll_points_2d, reconstructed_seed_mesh, seed_mesh_poses[frame])
-            mesh_roll_points_2d = mesh_roll_points_2d[intersection_mask]
-            needs_3d_reconstruction = True
-            dpg.set_value("status_message", f"{len(intersection_points_3d)} intersection points found on mesh.")
+        if reconstructed_seed_mesh is None:
+            dpg.set_value("status_message", "Error: Reconstruct seed mesh first.")
             dpg.show_item("status_message")
-            if len(intersection_points_3d) > 0:
-                run_mesh_roll_tracking(frame, np.array(mesh_roll_points_2d), cam_idx, num_frames=num_frames_per_iter)
-            else:
-                mesh_roll_points_2d = [] # Clear points if no intersections
+            mesh_roll_estimation_mode = False
+            return
+
+        num_frames_to_track = 150
+        start_frame = frame_idx
+        tracking_intervals = list(range(start_frame, start_frame + num_frames_to_track + 1, COT_STEP_SIZE))
+        idx_small, idx_large = POINT_NAMES.index('s_small'), POINT_NAMES.index('s_large')
+        found_valid_camera = False
+        # Iterate over ALL cameras to find valid views
+        for cam_idx in range(video_metadata['num_videos']):
+        # for cam_idx in [3]:
+            scattered_2d_pts, scattered_3d_pts = [], []
+            cam_tracking_intervals = tracking_intervals.copy()
+            for s_frame in cam_tracking_intervals:
+                point_small_2d = annotations[s_frame, cam_idx, idx_small]
+                point_large_2d = annotations[s_frame, cam_idx, idx_large]
+                if np.any(np.isnan(point_small_2d)) or np.any(np.isnan(point_large_2d)):
+                    print(f"Skipping {s_frame} for camera {cam_idx}")
+                    cam_tracking_intervals.remove(s_frame)  # TODO: still a bug here
+                    continue  # Skip if not annotated in this view
+                pts_2d = scatter_pts_between(point_small_2d, point_large_2d, num_points=80)
+                # Find where these 2D points hit the 3D mesh surface at start frame
+                intersections_3d, valid_mask = get_intersections_with_mesh_surface(
+                    best_individual[cam_idx], 
+                    pts_2d, 
+                    reconstructed_seed_mesh, 
+                    seed_mesh_poses[s_frame]
+                )
+                valid_pts_2d = pts_2d[valid_mask]  # Those that actually hit the mesh
+                scattered_2d_pts.append(valid_pts_2d)
+                scattered_3d_pts.append(intersections_3d)
+            mesh_roll_data[cam_idx] = {
+                'start_frame': cam_tracking_intervals,
+                'start_pts_2d': scattered_2d_pts,
+                'start_pts_3d': scattered_3d_pts
+            }
+            found_valid_camera = True
+
+        if found_valid_camera:
+            needs_3d_reconstruction = True
+            dpg.set_value("status_message", f"Initialised points on {len(mesh_roll_data)} cameras.")
+            dpg.show_item("status_message")
+            run_mesh_roll_tracking(start_frame, num_frames_to_track, COT_STEP_SIZE)
+        else:
+            dpg.set_value("status_message", "Error: No valid annotations found in any camera at this frame.")
+            dpg.show_item("status_message")
+            mesh_roll_estimation_mode = False
     else:
-        mesh_roll_points_2d = [] # Clear points when toggling off
-        intersection_points_3d = None
+        mesh_roll_data = {}
         needs_3d_reconstruction = True
 
 # --- Main DPG loop ---
